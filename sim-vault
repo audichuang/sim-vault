@@ -21,6 +21,7 @@ exit codes: 0 ok, 1 error, 2 usage, 3 no archive, 4 runtime not installed,
 Only 3 and 4 mean "fall back to the old way" (recreate the device). 5 is usually a share that
 remounts within minutes: wait and retry, or stop. A same-name blank device created after a 5
 and parked later would replace the logged-in archive; 7 guards against that.
+After a 4 the archive cannot be restored, so the recreated device's first park needs --replace.
 """
 import argparse
 import fcntl
