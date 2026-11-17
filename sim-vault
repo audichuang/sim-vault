@@ -6,7 +6,8 @@ restored simulator is ready to use. Only the device is archived; the iOS runtime
 and must still be installed when restoring.
 
 usage:
-  sim-vault park <name> [--shutdown]   archive the device, verify it, then delete it
+  sim-vault park <name> [--shutdown] [--replace]
+                                       archive the device, verify it, then delete it
   sim-vault restore <name>             bring it back into the default device set, print its UDID
   sim-vault list                       show archives in the vault
 
@@ -15,8 +16,11 @@ volume than ~/Library/Developer/CoreSimulator, so an unmounted share is refused 
 silently filling the local disk.
 
 exit codes: 0 ok, 1 error, 2 usage, 3 no archive, 4 runtime not installed,
-            5 vault unavailable, 6 device is booted (park without --shutdown)
-Callers should treat 3, 4 and 5 as "fall back to the old way" (keep or recreate the device).
+            5 vault unavailable, 6 device is booted (park without --shutdown),
+            7 park would overwrite an archive of a different device (pass --replace to allow)
+Only 3 and 4 mean "fall back to the old way" (recreate the device). 5 is usually a share that
+remounts within minutes: wait and retry, or stop. A same-name blank device created after a 5
+and parked later would replace the logged-in archive; 7 guards against that.
 """
 import argparse
 import fcntl
@@ -36,7 +40,7 @@ DEFAULT_SET = os.path.join(SIM_ROOT, "Devices")
 STAGING_ROOT = os.path.join(SIM_ROOT, "sim-vault-staging")
 CHUNK = 8 * 1024 * 1024
 
-EXIT_ERROR, EXIT_NO_ARCHIVE, EXIT_NO_RUNTIME, EXIT_NO_VAULT, EXIT_BOOTED = 1, 3, 4, 5, 6
+EXIT_ERROR, EXIT_NO_ARCHIVE, EXIT_NO_RUNTIME, EXIT_NO_VAULT, EXIT_BOOTED, EXIT_OVERWRITE = 1, 3, 4, 5, 6, 7
 
 
 class Fail(Exception):
@@ -169,7 +173,13 @@ def wait_until_quiet(device_dir, seconds=10, timeout=120):
     raise Fail(f"{device_dir} is still being written after {timeout}s; not archiving")
 
 
-def park(name, shutdown):
+def write_json(path, data):
+    with open(path + ".partial", "w") as handle:
+        json.dump(data, handle, indent=2)
+    os.replace(path + ".partial", path)
+
+
+def park(name, shutdown, replace=False):
     vault = vault_dir()
     tar_path, meta_path = archive_paths(vault, name)
     with NameLock(name):
@@ -177,6 +187,13 @@ def park(name, shutdown):
         if device is None:
             raise Fail(f"no simulator named '{name}'", EXIT_ERROR)
         udid = device["udid"]
+        if os.path.exists(meta_path) and not replace:
+            with open(meta_path) as handle:
+                old = json.load(handle)
+            if udid not in (old.get("udid"), old.get("restoredAs")):
+                raise Fail(f"the archive of '{name}' came from another device ({old.get('udid')}), "
+                           f"not {udid}; parking would replace it. Restore that archive instead, "
+                           "or pass --replace to drop it", EXIT_OVERWRITE)
         if device["state"] != "Shutdown":
             if not shutdown:
                 raise Fail(f"'{name}' is {device['state']}; shut it down first or pass --shutdown",
@@ -281,6 +298,12 @@ def restore(name):
                 log(f"warning: could not unregister staging copy: {exc}")
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+        # Record the new UDID so a later park of this device may replace its own archive.
+        meta["restoredAs"] = udid
+        try:
+            write_json(meta_path, meta)
+        except OSError as exc:
+            log(f"warning: could not record the restored UDID ({exc}); park will need --replace")
         log(f"restored {name} as {udid} in {time.time() - started:.0f}s "
             f"(archive kept at {tar_path})")
         print(udid)
@@ -307,13 +330,15 @@ def main():
     p_park.add_argument("name")
     p_park.add_argument("--shutdown", action="store_true",
                         help="shut the device down first if it is booted")
+    p_park.add_argument("--replace", action="store_true",
+                        help="replace an archive that came from a different device")
     p_restore = sub.add_parser("restore", help="restore the device and print its UDID")
     p_restore.add_argument("name")
     sub.add_parser("list", help="list archives in the vault")
     args = parser.parse_args()
     try:
         if args.command == "park":
-            park(args.name, args.shutdown)
+            park(args.name, args.shutdown, args.replace)
         elif args.command == "restore":
             restore(args.name)
         else:
