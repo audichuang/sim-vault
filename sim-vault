@@ -575,9 +575,39 @@ def read_leases(name):
 def read_boot_record(name):
     try:
         with open(boot_record_path(name)) as handle:
-            return json.load(handle)
+            record = json.load(handle)
     except (OSError, ValueError):
         return None
+    if isinstance(record.get("by"), str):
+        record["by"] = [record["by"]]
+    return record
+
+
+def reconcile_boot_record(name, devices):
+    """The boot record is written before `simctl boot`, so it can outlive a boot that never
+    happened or a device shut down by hand. Keep it only while that device is running.
+    Caller holds the lock."""
+    record = read_boot_record(name)
+    if not record:
+        return None
+    state = next((d["state"] for d in devices if d["udid"] == record.get("udid")), None)
+    if state in (None, "Shutdown"):
+        remove_file(boot_record_path(name))
+        return None
+    return record
+
+
+def blocking_leases(name, lease=None, exclusive=False):
+    """Other owners' leases that stand in the way: all of them for an exclusive request,
+    otherwise only exclusive ones."""
+    others = [l for l in read_leases(name) if not lease or l.get("owner") != lease]
+    return [l for l in others if exclusive or l.get("mode") == "exclusive"]
+
+
+def leased_fail(name, leases):
+    return Fail(f"'{name}' is leased by {describe_leases(leases)}", EXIT_BUSY, "busy",
+                "wait for that run to finish; if its lease is left over from a run "
+                f"that died, `sim-vault release '{name}' --lease <owner>`")
 
 
 def remove_file(path):
@@ -676,7 +706,11 @@ def wait_until_quiet(device_dir):
         time.sleep(POLL)
 
 
-def overwrite_message(name, old, udid):
+def overwrite_message(name, old, udid, tar_exists=True):
+    if not tar_exists:
+        return (f"the metadata of '{name}' came from another device ({old.get('udid')}) and "
+                "its tar is missing, so that archive cannot be restored any more",
+                "after checking nothing of that archive is needed, rerun with --replace")
     if runtime_available(old.get("runtime")):
         return (f"the archive of '{name}' came from another device ({old.get('udid')}), "
                 f"not {udid}; parking would replace it",
@@ -724,7 +758,7 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace):
     old = read_meta(meta_path)
     if old is not None and not replace and udid not in (old.get("udid"),
                                                         old.get("restoredAs")):
-        message, next_step = overwrite_message(name, old, udid)
+        message, next_step = overwrite_message(name, old, udid, os.path.exists(tar_path))
         raise Fail(message, EXIT_OVERWRITE, "overwrite", next_step)
     state = device["state"]
     if state in ("Booted", "Booting") and not shutdown:
@@ -963,6 +997,10 @@ def restore(name, wait=DEFAULT_WAIT):
     warnings = []
     with DeviceLock(name, wait):
         result = restore_locked(name, warnings)
+        drop_stale_leases(name, {d["udid"] for d in all_devices()})
+        blocking = blocking_leases(name)
+        if blocking:
+            raise leased_fail(name, blocking)
     result["warnings"] = warnings
     return result
 
@@ -975,22 +1013,23 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
         except Fail as exc:
             if exc.code not in (EXIT_NO_ARCHIVE, EXIT_NO_RUNTIME) or not create:
                 raise
+            # A 3 can still leave metadata behind (its tar is missing): the first park of
+            # the new device then meets that metadata and returns 7.
+            leftover_meta = exc.code == EXIT_NO_RUNTIME or os.path.exists(
+                archive_paths(vault_dir(), name)[1])
             udid = create_device(name, create)
             result = {"action": "created", "udid": udid, "state": "Shutdown",
-                      "matchesArchive": None if exc.code == EXIT_NO_ARCHIVE else False,
-                      "needsReplaceOnFirstPark": exc.code == EXIT_NO_RUNTIME,
-                      "archive": {"exists": exc.code == EXIT_NO_RUNTIME}}
+                      "matchesArchive": None if not leftover_meta else False,
+                      "needsReplaceOnFirstPark": leftover_meta,
+                      "archive": {"exists": leftover_meta}}
         udid = result["udid"]
-        present = {d["udid"] for d in all_devices()}
-        drop_stale_leases(name, present)
-        leases = read_leases(name)
-        mine = [l for l in leases if l.get("owner") == lease] if lease else []
-        others = [l for l in leases if not lease or l.get("owner") != lease]
-        blocking = [l for l in others if exclusive or l.get("mode") == "exclusive"]
+        devices = all_devices()
+        drop_stale_leases(name, {d["udid"] for d in devices})
+        reconcile_boot_record(name, devices)
+        mine = [l for l in read_leases(name) if l.get("owner") == lease] if lease else []
+        blocking = blocking_leases(name, lease, exclusive)
         if blocking:
-            raise Fail(f"'{name}' is leased by {describe_leases(blocking)}", EXIT_BUSY, "busy",
-                       "wait for that run to finish; if its lease is left over from a run "
-                       f"that died, `sim-vault release '{name}' --lease <owner>`")
+            raise leased_fail(name, blocking)
         state = device_state(udid)
         reentry = bool(mine) and mine[0].get("udid") == udid
         if exclusive and not reentry and state != "Shutdown":
@@ -1013,23 +1052,38 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
             os.makedirs(lease_dir(name), exist_ok=True)
             # The lease goes in before booting, so a device we boot always has an owner.
             write_json(lease_file, record)
+        booted_by_us = False
         try:
-            booted_by_us = False
             if boot:
                 state = device_state(udid)
                 if state == "Shutting Down":
                     state = wait_for_shutdown(udid)
                 if state == "Shutdown":
-                    log(f"booting {name}")
-                    simctl("boot", udid, timeout=STATE_TIMEOUT)
-                    booted_by_us = True
                     if lease:
-                        write_json(boot_record_path(name), {"udid": udid, "by": lease,
+                        # Written before booting: a kill during the boot still leaves the
+                        # shutdown duty on record (reconciled against the real state later).
+                        write_json(boot_record_path(name), {"udid": udid, "by": [lease],
                                                             "at": now_iso()})
+                    log(f"booting {name}")
+                    booted_by_us = True
+                    simctl("boot", udid, timeout=STATE_TIMEOUT)
                 # Booting devices too: return only once it is usable.
                 simctl("bootstatus", udid, "-b", timeout=BOOT_TIMEOUT)
         except BaseException:
-            if wrote_new:
+            keep_lease = False
+            if booted_by_us:
+                # Undo our own boot so a retry by the same owner does not find a running
+                # device without a lease (8). If that fails too, keep lease and record so
+                # `release --shutdown` can finish the job.
+                try:
+                    shutdown_device(udid)
+                    remove_file(boot_record_path(name))
+                except BaseException as exc:
+                    keep_lease = bool(lease)
+                    CLEANUP_FAILURES.append(f"shut down {name}: {exc}")
+                    log(f"warning: could not shut down {name} after the failed boot: {exc}; "
+                        f"`sim-vault release '{name}' --lease {lease} --shutdown` retries")
+            if wrote_new and not keep_lease:
                 remove_file(lease_file)
             raise
         if result.get("matchesArchive") is False and result["action"] == "existing":
@@ -1042,23 +1096,35 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
 
 def release(name, lease, shutdown=False, wait=DEFAULT_WAIT):
     with DeviceLock(name, wait):
-        present = {d["udid"] for d in all_devices()}
-        drop_stale_leases(name, present)
+        devices = all_devices()
+        drop_stale_leases(name, {d["udid"] for d in devices})
+        record = reconcile_boot_record(name, devices)
         path = lease_path(name, lease)
+        existed = os.path.exists(path)
         others = [l for l in read_leases(name) if l.get("owner") != lease]
-        record = read_boot_record(name)
+        responsible = bool(record) and existed and lease in record.get("by", [])
         did_shutdown = False
-        if shutdown and not others and record:
+        if shutdown and not others and responsible:
             # The lease stays until the device is down, so a failed shutdown can be rerun.
-            log(f"shutting down {name} (booted by ensure for {record.get('by')})")
+            log(f"shutting down {name} (booted by ensure for {', '.join(record['by'])})")
             shutdown_device(record["udid"])
             remove_file(boot_record_path(name))
             did_shutdown = True
         elif shutdown and others:
             log(f"not shutting down: still leased by {describe_leases(others)}")
+        elif shutdown and not existed:
+            log(f"not shutting down: {lease} holds no lease on it")
         elif shutdown:
-            log("not shutting down: sim-vault did not boot it under a lease")
-        existed = os.path.exists(path)
+            log("not shutting down: sim-vault did not boot it under this lease")
+        if record and not did_shutdown and existed:
+            if others and lease in record.get("by", []):
+                # Hand the shutdown duty to whoever is still using it.
+                record["by"] = [l.get("owner") for l in others]
+                write_json(boot_record_path(name), record)
+            elif not others:
+                # Last lease gone without --shutdown: nobody is left to shut it down, and a
+                # later owner must not inherit a device it did not boot.
+                remove_file(boot_record_path(name))
         remove_file(path)
         return {"action": "released" if existed else "no-lease", "lease": lease,
                 "shutdown": did_shutdown, "remaining": [lease_view(l) for l in others]}
