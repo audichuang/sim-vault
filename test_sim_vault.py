@@ -953,6 +953,16 @@ class T2SharedLayer(SimVaultCase):
         self.assertFalse(os.path.exists(old_partial))
         self.assertTrue(os.path.exists(os.path.join(self.vault, "OTHER x.tar.partial")))
 
+    def test_gc_and_ensure_ignore_live_pid_when_lock_is_free(self):
+        self.parked("SVTEST a")
+        temp = self.xcrun("create", f"SVTEST a [sim-vault restoring {os.getpid()}]",
+                          "iPhone 18 Pro Max", RT)
+        rc, d = self.js("gc", "--dry-run", "--name-prefix", "SVTEST")
+        self.assertEqual([x["kind"] for x in d["deleted"]], ["restoring-device"])
+        rc, d = self.js("ensure", "SVTEST a")
+        self.assertEqual((rc, d["action"]), (0, "restored"))
+        self.assertNotIn(temp, [x["UDID"] for x in self.devices()])
+
     def test_gc_skips_when_lock_held(self):                    # Codex 5
         self.parked("SVTEST a")
         self.hooks([{"cmd": "rename", "n": 1, "action": "sleep", "seconds": 8}])

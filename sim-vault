@@ -385,16 +385,6 @@ def matches_archive(udid, meta):
 
 # -- locks -----------------------------------------------------------------------------
 
-def pid_alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def lock_path(name):
     return os.path.join(LOCK_DIR, safe_key(name) + ".lock")
 
@@ -764,7 +754,8 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace):
         latest, path = newest_mtime(device_dir, time.time())
         if state != "Shutdown" or latest >= started:
             raise Fail(f"'{name}' changed while it was being archived (now {state}; "
-                       f"latest write {path}); the old archive and the device were kept",
+                       f"latest write {path}, {latest - started:+.1f}s after archiving "
+                       "started); the old archive and the device were kept",
                        EXIT_BUSY, "busy", "let whoever uses it finish, then park again")
         meta = {
             "name": name,
@@ -804,14 +795,13 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace):
 # -- restore / ensure ------------------------------------------------------------------
 
 def remove_stale_restoring(name, devices=None):
-    """Delete devices left as '<name> [sim-vault restoring <pid>]' by a dead restore.
-    Caller holds the device lock, so no restore of this name is running."""
+    """Delete devices left as '<name> [sim-vault restoring <pid>]' by an interrupted restore.
+    The caller holds the device lock, and a restore (or a child of a killed one) keeps it
+    until it stops, so every such device is a leftover; the pid in the name is only a hint
+    and may have been reused."""
     prefix = name + RESTORING
     for device in devices if devices is not None else all_devices():
-        if not device["name"].startswith(prefix):
-            continue
-        match = re.match(r"(\d+)\]$", device["name"][len(prefix):])
-        if match and not pid_alive(int(match.group(1))):
+        if device["name"].startswith(prefix):
             log(f"deleting {device['name']} ({device['udid']}) left by an interrupted restore")
             simctl("delete", device["udid"])
 
@@ -1131,15 +1121,14 @@ def gc(dry_run=False, leases_older_than=86400, prefix=None):
         if lock is None:
             attention.append({"kind": "busy", "what": name, "note": "lock held; skipped"})
             continue
+        # Holding the lock means no restore of this name is running (its children keep the
+        # lock too), so what is left is a leftover whatever the recorded pid says.
         try:
             for device in by_name.get(name, []):
-                match = re.search(r"restoring (\d+)\]$", device["name"])
-                if match and pid_alive(int(match.group(1))):
-                    continue
                 act("restoring-device", f"{device['name']} ({device['udid']})",
                     lambda u=device["udid"]: simctl("delete", u))
             for owner_name, pid, path in staging_sets:
-                if owner_name == name and not (pid and pid_alive(pid)):
+                if owner_name == name:
                     act("staging", path, lambda p=path: shutil.rmtree(p, ignore_errors=True))
         finally:
             lock.__exit__(None, None, None)
