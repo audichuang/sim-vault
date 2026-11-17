@@ -157,6 +157,8 @@ elif sub in ("rename", "delete", "boot", "shutdown", "bootstatus", "spawn"):
             fail("Unable to boot device in current state: " + st, 149)
         set_state(d, "Booted")
     elif sub == "shutdown":
+        if os.environ.get("FAKE_SHUTDOWN_RC"):
+            fail("shutdown failed", int(os.environ["FAKE_SHUTDOWN_RC"]))
         if st == "Shutdown":
             fail("Unable to shutdown device in current state: Shutdown", 149)
         if os.environ.get("FAKE_SLOW_SHUTDOWN"):
@@ -166,6 +168,8 @@ elif sub in ("rename", "delete", "boot", "shutdown", "bootstatus", "spawn"):
         else:
             set_state(d, "Shutdown")
     elif sub == "bootstatus":
+        if os.environ.get("FAKE_BOOTSTATUS_RC"):
+            fail("bootstatus failed", int(os.environ["FAKE_BOOTSTATUS_RC"]))
         if st in ("Shutdown", "Booting"):
             set_state(d, "Booted")
 else:
@@ -522,11 +526,13 @@ class T1Core(SimVaultCase):
 
     def test_restore_killed_leaves_temp_device_cleaned_next_time(self):
         self.parked("SVTEST a")
-        self.hooks([{"cmd": "rename", "n": 1, "action": "sleep", "seconds": 30}])
+        # Killed while the staging copy is being unregistered (after clone, before rename).
+        self.hooks([{"cmd": "delete", "n": 1, "action": "sleep", "seconds": 2}])
         p = self.spawn("restore", "SVTEST a")
-        self.wait_for(lambda: self.count("rename") >= 1)
+        self.wait_for(lambda: self.count("delete") >= 1)
         p.kill()
         p.communicate(timeout=30)
+        time.sleep(2.5)   # the sleeping simctl child holds the lock until it exits
         names = [d["name"] for d in self.devices()]
         self.assertEqual(len(names), 1)
         self.assertIn("[sim-vault restoring", names[0])
@@ -639,6 +645,379 @@ class T1Core(SimVaultCase):
                 return
             time.sleep(0.05)
         self.fail("condition not reached")
+
+
+class T2SharedLayer(SimVaultCase):
+    def js(self, *args, **extra):
+        r = self.sv(*args, "--json", **extra)
+        try:
+            data = json.loads(r.stdout)        # exactly one object, also on failure
+        except ValueError:
+            self.fail(f"stdout is not one JSON object: {r.stdout!r} / {r.stderr}")
+        if r.returncode:
+            self.assertEqual((data["ok"], data["code"]), (False, r.returncode))
+            self.assertTrue(data["kind"] and data["message"] and data["next"], data)
+        else:
+            self.assertTrue(data["ok"])
+        return r.returncode, data
+
+    def leases_dir(self):
+        return os.path.join(self.home, "Library/Developer/CoreSimulator/sim-vault/leases")
+
+    # -- status ----------------------------------------------------------------------
+    def test_status(self):
+        rc, d = self.js("status", "SVTEST a")
+        self.assertEqual((rc, d["count"], d["udid"], d["archive"]["exists"]), (0, 0, None, False))
+        udid = self.parked("SVTEST a")
+        rc, d = self.js("status", "SVTEST a")
+        self.assertEqual((d["archive"]["udid"], d["archive"]["runtimeAvailable"]), (udid, True))
+        new = self.sv("restore", "SVTEST a").stdout.strip()
+        self.create("SVTEST a", available=False)
+        rc, d = self.js("status", "SVTEST a")
+        self.assertEqual((d["udid"], d["state"], d["count"], d["unavailableCount"],
+                          d["matchesArchive"], d["posterMB"]), (new, "Shutdown", 1, 1, True, 0))
+        r = self.sv("status", "SVTEST a")
+        self.assertEqual(r.stdout.strip(), new)
+
+    def test_status_duplicates_and_vault_unavailable_is_0(self):
+        self.create("SVTEST a")
+        self.create("SVTEST a")
+        self.vault = os.path.join(self.base, "unmounted", "vault")
+        rc, d = self.js("status", "SVTEST a")
+        self.assertEqual((rc, d["count"], d["udid"]), (0, 2, None))
+        self.assertIn("vaultError", d["archive"])
+
+    # -- ensure ----------------------------------------------------------------------
+    def test_ensure_existing_restored_created(self):
+        udid = self.create("SVTEST a")
+        rc, d = self.js("ensure", "SVTEST a")
+        self.assertEqual((rc, d["action"], d["udid"], d["matchesArchive"]), (0, "existing", udid, None))
+        self.assertEqual(self.sv("park", "SVTEST a").returncode, 0)
+        r = self.sv("ensure", "SVTEST a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout, r"^[0-9A-F-]{36}\n$")
+        self.assertEqual(self.sv("park", "SVTEST a").returncode, 0)
+        rc, d = self.js("ensure", "SVTEST a")
+        self.assertEqual((rc, d["action"], d["matchesArchive"]), (0, "restored", True))
+        rc, d = self.js("ensure", "SVTEST b")
+        self.assertEqual((rc, d["kind"]), (3, "no-archive"))
+        self.assertEqual(self.devices("SVTEST b"), [])
+        rc, d = self.js("ensure", "SVTEST b", "--create", "iPhone 18 Pro Max")
+        self.assertEqual((rc, d["action"], d["needsReplaceOnFirstPark"]), (0, "created", False))
+        self.assertEqual(self.devices("SVTEST b")[0]["runtime"], RT)
+
+    def test_ensure_create_after_4_then_existing_then_park_7(self):   # scenario (b)
+        self.parked("SVTEST a")
+        self.set_runtimes([RT_OLD])
+        self.assertEqual(self.js("ensure", "SVTEST a")[0], 4)
+        rc, d = self.js("ensure", "SVTEST a", "--create", "iPhone 18 Pro Max")
+        self.assertEqual((rc, d["action"], d["needsReplaceOnFirstPark"]), (0, "created", True))
+        rc, d = self.js("ensure", "SVTEST a")
+        self.assertEqual((rc, d["action"], d["matchesArchive"]), (0, "existing", False))
+        self.assertTrue(d["warnings"])
+        r = self.sv("park", "SVTEST a")
+        self.assertEqual(r.returncode, 7)
+        self.assertIn("cannot be restored", r.stderr)
+
+    def test_ensure_5_never_creates(self):
+        self.vault = os.path.join(self.base, "unmounted", "vault")
+        rc, d = self.js("ensure", "SVTEST a", "--create", "iPhone 18 Pro Max")
+        self.assertEqual((rc, d["kind"]), (5, "vault-unavailable"))
+        self.assertEqual(self.devices(), [])
+
+    def test_ensure_10_blank_device(self):                       # scenario (a)
+        self.parked("SVTEST a")
+        self.create("SVTEST a")
+        rc, d = self.js("ensure", "SVTEST a", "--create", "iPhone 18 Pro Max")
+        self.assertEqual((rc, d["kind"]), (10, "not-archived-device"))
+
+    def test_10_from_local_record_while_vault_unavailable(self):   # F2
+        self.parked("SVTEST a")
+        self.create("SVTEST a")
+        self.vault = os.path.join(self.base, "unmounted", "vault")
+        rc, d = self.js("restore", "SVTEST a")
+        self.assertEqual(rc, 10)
+        self.assertIn("record", d["message"])
+
+    def test_ensure_restored_device_ok_while_vault_unavailable(self):
+        self.parked("SVTEST a")
+        new = self.sv("ensure", "SVTEST a").stdout.strip()
+        self.vault = os.path.join(self.base, "unmounted", "vault")
+        rc, d = self.js("ensure", "SVTEST a")
+        self.assertEqual((rc, d["udid"], d["matchesArchive"]), (0, new, True))
+
+    def test_ensure_boot_booting_device_waits(self):            # B-B7
+        udid = self.create("SVTEST a", state="Booting")
+        rc, d = self.js("ensure", "SVTEST a", "--boot")
+        self.assertEqual((rc, d["state"], d["bootedByUs"]), (0, "Booted", False))
+        self.assertEqual(self.state(udid), "Booted")
+
+    # -- leases ----------------------------------------------------------------------
+    def test_lease_cycle(self):
+        udid = self.create("SVTEST a")
+        rc, d = self.js("ensure", "SVTEST a", "--boot", "--lease", "t1")
+        self.assertEqual((rc, d["bootedByUs"], d["lease"]), (0, True, "t1"))
+        rc, d = self.js("park", "SVTEST a")
+        self.assertEqual(rc, 8)
+        self.assertIn("t1", d["message"])
+        rc, d = self.js("release", "SVTEST a", "--lease", "t1", "--shutdown")
+        self.assertEqual((rc, d["shutdown"]), (0, True))
+        self.assertEqual(self.state(udid), "Shutdown")
+        rc, d = self.js("release", "SVTEST a", "--lease", "t1", "--shutdown")   # idempotent
+        self.assertEqual((rc, d["action"]), (0, "no-lease"))
+        self.assertEqual(self.js("park", "SVTEST a")[0], 0)
+
+    def test_exclusive_needs_lease(self):
+        self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--exclusive")[0], 2)
+
+    def test_exclusive_is_persistent(self):                     # Codex 2
+        self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--exclusive", "--boot", "--lease", "A")[0], 0)
+        self.assertEqual(self.js("ensure", "SVTEST a", "--boot", "--lease", "B")[0], 8)
+        self.assertEqual(self.js("ensure", "SVTEST a")[0], 8)
+        rc, d = self.js("ensure", "SVTEST a", "--exclusive", "--boot", "--lease", "A")   # re-entry
+        self.assertEqual((rc, d["bootedByUs"]), (0, False))
+
+    def test_exclusive_refuses_shared_holder_and_unleased_running(self):
+        udid = self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--lease", "S")[0], 0)
+        self.assertEqual(self.js("ensure", "SVTEST a", "--exclusive", "--lease", "X")[0], 8)
+        self.assertEqual(self.js("release", "SVTEST a", "--lease", "S")[0], 0)
+        self.patch_device(udid, fakeState="Booted")
+        rc, d = self.js("ensure", "SVTEST a", "--exclusive", "--lease", "X")
+        self.assertEqual(rc, 8)
+        self.assertIn("no lease", d["message"])
+        self.assertEqual(os.listdir(os.path.join(self.leases_dir(), os.listdir(self.leases_dir())[0])), [])
+
+    def test_shared_leases_last_release_shuts_down(self):     # Codex 4
+        udid = self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--boot", "--lease", "A")[0], 0)
+        rc, d = self.js("ensure", "SVTEST a", "--boot", "--lease", "B")
+        self.assertEqual((rc, d["bootedByUs"]), (0, False))
+        rc, d = self.js("release", "SVTEST a", "--lease", "A", "--shutdown")
+        self.assertEqual((rc, d["shutdown"]), (0, False))
+        self.assertEqual(self.state(udid), "Booted")
+        rc, d = self.js("release", "SVTEST a", "--lease", "B", "--shutdown")
+        self.assertEqual((rc, d["shutdown"]), (0, True))
+        self.assertEqual(self.state(udid), "Shutdown")
+
+    def test_release_without_boot_by_lease_does_not_shut_down(self):
+        udid = self.create("SVTEST a", state="Booted")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--boot", "--lease", "A")[0], 0)
+        rc, d = self.js("release", "SVTEST a", "--lease", "A", "--shutdown")
+        self.assertEqual((rc, d["shutdown"]), (0, False))
+        self.assertEqual(self.state(udid), "Booted")
+
+    def test_release_keeps_lease_when_shutdown_fails(self):     # Codex 3
+        udid = self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--boot", "--lease", "A")[0], 0)
+        rc, _ = self.js("release", "SVTEST a", "--lease", "A", "--shutdown", FAKE_SHUTDOWN_RC=1)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.js("park", "SVTEST a")[0], 8)      # lease still there
+        rc, d = self.js("release", "SVTEST a", "--lease", "A", "--shutdown")
+        self.assertEqual((rc, d["shutdown"]), (0, True))
+        self.assertEqual(self.state(udid), "Shutdown")
+
+    def test_ensure_failure_withdraws_new_lease(self):          # F5
+        self.create("SVTEST a")
+        rc, _ = self.js("ensure", "SVTEST a", "--boot", "--lease", "A", FAKE_BOOTSTATUS_RC=1)
+        self.assertEqual(rc, 1)
+        rc, d = self.js("status", "SVTEST a")
+        self.assertEqual(d["leases"], [])
+
+    def test_stale_lease_for_gone_device_is_dropped(self):      # F5, scenario (e)
+        self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--lease", "A")[0], 0)
+        old = self.devices("SVTEST a")[0]["UDID"]
+        self.xcrun("delete", old)
+        new = self.create("SVTEST a")
+        rc, d = self.js("status", "SVTEST a")
+        self.assertTrue(d["leases"][0]["stale"])
+        rc, d = self.js("park", "SVTEST a")
+        self.assertEqual(rc, 0, d)
+
+    def test_live_lease_blocks_park_and_gc_lists_it(self):      # scenario (e)
+        self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--lease", "A")[0], 0)
+        rc, d = self.js("gc", "--leases-older-than", "0s", "--name-prefix", "SVTEST")
+        self.assertEqual(rc, 0)
+        self.assertEqual([a["what"] for a in d["attention"] if a["kind"] == "lease"], ["A"])
+        self.assertEqual(self.js("park", "SVTEST a")[0], 8)
+
+    def test_same_owner_new_udid_rewrites_lease(self):          # F6
+        self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--lease", "A")[0], 0)
+        self.assertEqual(self.js("release", "SVTEST a", "--lease", "A")[0], 0)
+        self.assertEqual(self.js("park", "SVTEST a")[0], 0)
+        self.assertEqual(self.js("ensure", "SVTEST a", "--lease", "A")[0], 0)
+        rc, d = self.js("status", "SVTEST a")
+        self.assertEqual(d["leases"][0]["udid"], d["udid"])
+
+    # -- park preflight ----------------------------------------------------------------
+    def test_park_missing_ok(self):
+        rc, d = self.js("park", "SVTEST none", "--missing-ok")
+        self.assertEqual((rc, d["action"]), (0, "absent"))
+        self.assertEqual(self.js("park", "SVTEST none")[0], 1)
+
+    def test_posterboard_limit(self):
+        udid = self.create("SVTEST a", state="Booted")
+        store = os.path.join(self.devset, udid,
+                             "data/Library/Application Support/PRBPosterExtensionDataStore")
+        os.makedirs(store)
+        with open(os.path.join(store, "big"), "wb") as h:
+            h.write(os.urandom(1024 * 1024) * 1025)          # real bytes, not sparse
+        rc, d = self.js("park", "SVTEST a", "--shutdown")
+        self.assertEqual((rc, d["kind"]), (9, "posterboard-bloated"))
+        self.assertEqual(self.state(udid), "Booted")         # not even shut down
+        os.truncate(os.path.join(store, "big"), 900 * 1024 * 1024)
+        rc, d = self.js("park", "SVTEST a", "--shutdown")
+        self.assertEqual((rc, d["posterMB"]), (0, 900))
+
+    def test_busy_lock_probe_and_hold(self):                    # Codex 1
+        import fcntl
+        udid = self.create("SVTEST a")
+        tmpl = os.path.join(self.base, "hl-{udid}.lock")
+        path = tmpl.replace("{udid}", udid)
+        write(path, "")
+        with open(path) as h:
+            fcntl.flock(h, fcntl.LOCK_EX)
+            rc, d = self.js("park", "SVTEST a", "--busy-lock", tmpl)
+            self.assertEqual(rc, 8)
+        p = self.spawn("park", "SVTEST a", "--busy-lock", tmpl, FAKE_TAR_SLEEP=3)
+        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        with open(path) as h:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(h, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _o, err = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertEqual(os.path.getsize(path), 0)            # not truncated or written
+        missing = os.path.join(self.base, "nothing-{udid}.lock")
+        self.create("SVTEST b")
+        self.assertEqual(self.js("park", "SVTEST b", "--busy-lock", missing)[0], 0)
+        self.assertFalse(os.path.exists(missing.replace("{udid}", "x")))
+
+    # -- json / usage / list ------------------------------------------------------------
+    def test_json_errors_are_one_object(self):
+        rc, d = self.js("restore", "SVTEST none")
+        self.assertEqual(d["code"], 3)
+        rc, d = self.js("park")
+        self.assertEqual((rc, d["kind"]), (2, "usage"))
+        rc, d = self.js("release", "SVTEST a")
+        self.assertEqual(rc, 2)
+
+    def test_list_json(self):
+        self.parked("SVTEST a")
+        write(os.path.join(self.vault, "broken.json"), "{")
+        write(os.path.join(self.vault, "orphan.tar"), "")
+        rc, d = self.js("list")
+        self.assertEqual(rc, 0)
+        self.assertEqual([a["name"] for a in d["archives"]], ["SVTEST a"])
+        self.assertEqual([e["file"] for e in d["errors"]], ["broken.json"])
+        self.assertEqual(d["orphanTars"], ["orphan.tar"])
+
+    def test_help_lists_commands_and_codes(self):
+        r = self.sv("--help")
+        self.assertEqual(r.returncode, 0)
+        for word in ("ensure", "release", "gc", "10 restore/ensure", "9  park"):
+            self.assertIn(word, r.stdout)
+
+    # -- gc ----------------------------------------------------------------------------
+    def test_gc(self):
+        self.parked("SVTEST a")
+        # Killed while the staging copy is being unregistered (after clone, before rename).
+        self.hooks([{"cmd": "delete", "n": 1, "action": "sleep", "seconds": 2}])
+        p = self.spawn("restore", "SVTEST a")
+        self.wait_for(lambda: self.count("delete") >= 1)
+        p.kill()
+        p.communicate(timeout=30)
+        time.sleep(2.5)   # the sleeping simctl child holds the lock until it exits
+        self.hooks([])
+        old_partial = os.path.join(self.vault, "SVTEST a.tar.partial")
+        write(old_partial, "x")
+        os.utime(old_partial, (time.time() - 7200, time.time() - 7200))
+        write(os.path.join(self.vault, "SVTEST lone.json"), "{}")
+        write(os.path.join(self.vault, "OTHER x.tar.partial"), "x")
+        os.utime(os.path.join(self.vault, "OTHER x.tar.partial"), (0, 0))
+        rc, d = self.js("gc", "--dry-run", "--name-prefix", "SVTEST")
+        self.assertEqual(rc, 0, d)
+        kinds = sorted(x["kind"] for x in d["deleted"])
+        self.assertEqual(kinds, ["partial", "restoring-device", "staging"])
+        self.assertEqual(len(self.devices()), 1)               # dry run touched nothing
+        self.assertIn("unpaired", [a["kind"] for a in d["attention"]])
+        rc, d = self.js("gc", "--name-prefix", "SVTEST")
+        self.assertEqual(self.devices(), [])
+        self.assertEqual(self.staging(), [])
+        self.assertFalse(os.path.exists(old_partial))
+        self.assertTrue(os.path.exists(os.path.join(self.vault, "OTHER x.tar.partial")))
+
+    def test_gc_skips_when_lock_held(self):                    # Codex 5
+        self.parked("SVTEST a")
+        self.hooks([{"cmd": "rename", "n": 1, "action": "sleep", "seconds": 8}])
+        p = self.spawn("restore", "SVTEST a")
+        self.wait_for(lambda: self.count("rename") >= 1)
+        rc, d = self.js("gc", "--name-prefix", "SVTEST")
+        self.assertEqual(d["deleted"], [])
+        self.assertIn("busy", [a["kind"] for a in d["attention"]])
+        _o, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertEqual([x["name"] for x in self.devices()], ["SVTEST a"])
+
+    def shim(self):
+        path = os.path.join(self.stub, "sim-vault")
+        write(path, f'#!/bin/bash\nexec {PY} {self.loader} "$@"\n')
+        os.chmod(path, 0o755)
+
+    def test_bash32_caller_example(self):
+        self.shim()
+        script = textwrap.dedent("""\
+            set -euo pipefail
+            N="SVTEST a"
+            rc=0; udid="$(sim-vault ensure "$N" --create "iPhone 18 Pro Max" --boot)" || rc=$?
+            if [ "$rc" -ne 0 ]; then echo "ensure failed: ${rc}" >&2; exit "$rc"; fi
+            echo "got ${udid}"
+            rc=0; sim-vault park "$N" || rc=$?
+            echo "park rc=${rc}"
+            rc=0; sim-vault park "$N" --shutdown --missing-ok || rc=$?
+            echo "park2 rc=${rc}"
+            rc=0; sim-vault ensure "$N" >/dev/null || rc=$?
+            echo "ensure2 rc=${rc}"
+            """)
+        r = subprocess.run(["/bin/bash", "--noprofile", "--norc", "-c", script], env=self.env(),
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("park rc=6", r.stdout)
+        self.assertIn("park2 rc=0", r.stdout)
+        self.assertIn("ensure2 rc=0", r.stdout)
+
+    def test_python_caller_example(self):
+        self.shim()
+        code = textwrap.dedent("""\
+            import json, subprocess, sys
+            def sv(*a):
+                p = subprocess.run(["sim-vault", *a, "--json"], capture_output=True, text=True)
+                return p.returncode, json.loads(p.stdout)
+            rc, d = sv("ensure", "SVTEST a", "--create", "iPhone 18 Pro Max",
+                       "--exclusive", "--boot", "--lease", "/tmp/evidence")
+            assert rc == 0 and d["bootedByUs"], d
+            rc, d = sv("release", "SVTEST a", "--lease", "/tmp/evidence", "--shutdown")
+            assert rc == 0 and d["shutdown"], d
+            rc, d = sv("park", "SVTEST a", "--missing-ok")
+            assert rc == 0 and d["action"] == "parked", d
+            print("ok")
+            """)
+        r = subprocess.run([PY, "-c", code], env=self.env(), capture_output=True, text=True,
+                           timeout=120)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "ok"), r.stderr)
+
+    def mkdir(self, name):
+        return T1Core.mkdir(self, name)
+
+    def staging(self):
+        return T1Core.staging(self)
+
+    def wait_for(self, predicate, timeout=20):
+        return T1Core.wait_for(self, predicate, timeout)
 
 
 if __name__ == "__main__":

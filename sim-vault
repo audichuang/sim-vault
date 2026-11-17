@@ -1,31 +1,51 @@
 #!/usr/bin/env python3
-"""Park an iOS simulator as a tar archive on another volume, and restore it later.
+"""Keep resident iOS simulators parked as tar archives on another volume, and get them back.
 
 The archive keeps the whole device (installed apps, keychain, logins, settings), so a
 restored simulator is ready to use. Only the device is archived; the iOS runtime is shared
 and must still be installed when restoring.
 
-usage:
-  sim-vault park <name> [--shutdown] [--replace] [--wait SEC]
-                                       archive the device, verify it, then delete it
-  sim-vault restore <name> [--wait SEC]
-                                       bring it back into the default device set, print its UDID
-  sim-vault list                       show archives in the vault
+Project scripts should call `ensure` to get a device and `park` to put it away, and pass the
+exit code on. They should not branch on 3/4/5 themselves: `ensure --create` already does that.
+
+commands (see `sim-vault <command> --help` for flags):
+  status <name>    what is local, what is archived, who uses it; no lock, always 0
+  ensure <name>    use the local device, else restore it, else (3/4 with --create) create it;
+                   optionally --boot and register a --lease; prints the UDID
+  restore <name>   `ensure` without policy: never creates or boots; prints the UDID
+  park <name>      archive, verify, then delete the device (refuses while it is in use)
+  release <name>   drop a lease; with --shutdown the last lease shuts down what ensure booted
+  list             archives in the vault
+  gc               remove what interrupted runs left behind (dry-run first)
+Every command takes --json: stdout is then exactly one JSON object, also on failure:
+{"ok": false, "code": 5, "kind": "vault-unavailable", "message": "...", "next": "..."}.
+Messages go to stderr; every failure ends with a "next:" line.
 
 The vault is $SIM_VAULT_DIR (default /Volumes/WorkSpace/ios-sim). It must sit on a different
 volume than ~/Library/Developer/CoreSimulator, so an unmounted share is refused instead of
-silently filling the local disk.
+silently filling the local disk. Locks, leases and staging live in
+~/Library/Developer/CoreSimulator/sim-vault/ (fixed paths, not $TMPDIR).
 
-exit codes: 0 ok, 1 error, 2 usage, 3 no archive, 4 runtime not installed,
-            5 vault unavailable, 6 device is booted (park without --shutdown),
-            7 park would overwrite an archive of a different device (pass --replace to allow),
-            8 busy: the device lock was not free within --wait, or the device was booted
-              while it was being archived (nothing deleted),
-            10 the local device with this name is not the archived one (restore)
-Only 3 and 4 mean "fall back to the old way" (recreate the device). 5 is usually a share that
-remounts within minutes: wait and retry, or stop. A same-name blank device created after a 5
-and parked later would replace the logged-in archive; 7 and 10 guard against that.
-After a 4 the archive cannot be restored, so the recreated device's first park needs --replace.
+exit codes and what the caller does next:
+  0  ok
+  1  error (simctl, tar, read-back mismatch, several devices with the name): stop, look, do
+     not recreate the device
+  2  usage
+  3  no archive (restore/ensure without --create): project policy - create the device or ask
+  4  runtime of the archive not installed: same as 3; the new device's first park returns 7,
+     and needs --replace once you have checked the old archive is not needed
+  5  vault unavailable (share not mounted): wait for it and retry; never create a same-name
+     device meanwhile - parking it later would replace the logged-in archive
+  6  park: the device is booted and --shutdown was not given: shut it down or pass --shutdown
+  7  park would replace the archive of another device: do not add --replace automatically
+  8  busy: device lock not free within --wait, another owner's lease, a --busy-lock held, an
+     exclusive ensure on a device that is running, or the device was booted while being
+     archived (nothing deleted). The message names the holder; wait for it, or release it
+     if it is stale. If the same holder returns 8 twice, stop and report it
+  9  park: PosterBoard data is over 1 GiB; rebuild it (modern-ios-guidance, PosterBoard) and
+     park again; nothing was touched
+  10 restore/ensure: the local device with this name is not the archived one, and the
+     archive can still be restored: stop and report; do not delete or park on your own
 """
 import argparse
 import fcntl
@@ -49,18 +69,29 @@ DEFAULT_SET = os.path.join(SIM_ROOT, "Devices")
 # Fixed paths, not $TMPDIR: two sessions with different TMPDIRs must see the same locks.
 STATE_ROOT = os.path.join(SIM_ROOT, "sim-vault")
 LOCK_DIR = os.path.join(STATE_ROOT, "locks")
+LEASE_DIR = os.path.join(STATE_ROOT, "leases")
+RECORD_DIR = os.path.join(STATE_ROOT, "archives")
 STAGING_ROOT = os.path.join(STATE_ROOT, "staging")
 LEGACY_STAGING_ROOT = os.path.join(SIM_ROOT, "sim-vault-staging")
+POSTER_STORE = os.path.join("data", "Library", "Application Support",
+                            "PRBPosterExtensionDataStore")
+POSTER_LIMIT_KB = 1024 * 1024
 CHUNK = 8 * 1024 * 1024
 QUIET_SECONDS = 10
 QUIET_TIMEOUT = 120
 STATE_TIMEOUT = 120
+BOOT_TIMEOUT = 300
 POLL = 1.0
 DEFAULT_WAIT = 60
+STALE_AFTER = 3600
 RESTORING = " [sim-vault restoring "
 
 (EXIT_ERROR, EXIT_USAGE, EXIT_NO_ARCHIVE, EXIT_NO_RUNTIME, EXIT_NO_VAULT, EXIT_BOOTED,
- EXIT_OVERWRITE, EXIT_BUSY, EXIT_NOT_ARCHIVED) = 1, 2, 3, 4, 5, 6, 7, 8, 10
+ EXIT_OVERWRITE, EXIT_BUSY, EXIT_POSTER, EXIT_NOT_ARCHIVED) = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+
+# File descriptors of the locks this process holds. Every child gets them, so a tar or
+# simctl still running after this process dies keeps the device locked until it stops.
+HELD_FDS = []
 
 
 class Fail(Exception):
@@ -68,7 +99,8 @@ class Fail(Exception):
         super().__init__(message)
         self.code = code
         self.kind = kind
-        self.next_step = next_step
+        self.next_step = next_step or ("stop and look into the message above; do not "
+                                       "recreate or delete the device to get past it")
 
 
 class Interrupted(BaseException):
@@ -89,16 +121,31 @@ def log(message):
     print(f"sim-vault: {message}", file=sys.stderr, flush=True)
 
 
-def simctl(*args, device_set=None):
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def run(cmd, timeout=None, **kwargs):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                          pass_fds=tuple(HELD_FDS), **kwargs)
+
+
+def simctl(*args, device_set=None, timeout=None):
     cmd = ["xcrun", "simctl"]
     if device_set:
         cmd += ["--set", device_set]
     cmd += list(args)
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = run(cmd, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise Fail(f"{' '.join(cmd)} did not finish in {timeout}s",
+                   next_step="check the device in `xcrun simctl list devices`, then rerun")
     if result.returncode != 0:
         raise Fail(f"{' '.join(cmd)} failed: {result.stderr.strip()}")
     return result.stdout
 
+
+# -- devices and runtimes -------------------------------------------------------------
 
 def all_devices(device_set=None):
     data = json.loads(simctl("list", "devices", "-j", device_set=device_set))
@@ -116,13 +163,17 @@ def resolve(name):
     return available, len(matches) - len(available)
 
 
-def find_one(name):
+def find_one(name, warnings=None):
     matches, unavailable = resolve(name)
     if unavailable:
-        log(f"warning: {unavailable} unavailable simulator(s) named '{name}' ignored")
+        message = f"{unavailable} unavailable simulator(s) named '{name}' ignored"
+        log(f"warning: {message}")
+        if warnings is not None:
+            warnings.append(message)
     if len(matches) > 1:
         listing = ", ".join(f"{d['udid']} ({d['state']})" for d in matches)
         raise Fail(f"{len(matches)} simulators are named '{name}': {listing}",
+                   kind="duplicate-name",
                    next_step="names must be unique; delete the extra one after checking "
                              "it holds nothing you need, then rerun")
     return matches[0] if matches else None
@@ -147,11 +198,74 @@ def wait_for_shutdown(udid, timeout=STATE_TIMEOUT):
         time.sleep(POLL)
 
 
+def shutdown_device(udid):
+    state = device_state(udid)
+    if state in ("Booted", "Booting"):
+        simctl("shutdown", udid, timeout=STATE_TIMEOUT)
+    return wait_for_shutdown(udid)
+
+
+def list_runtimes():
+    return json.loads(simctl("list", "runtimes", "-j"))["runtimes"]
+
+
 def runtime_available(identifier, runtimes=None):
     if runtimes is None:
-        runtimes = json.loads(simctl("list", "runtimes", "-j"))["runtimes"]
+        runtimes = list_runtimes()
     return any(r["identifier"] == identifier and r.get("isAvailable") for r in runtimes)
 
+
+def version_key(text):
+    parts = [int(p) for p in re.findall(r"\d+", text or "")[:3]]
+    return tuple(parts + [0] * (3 - len(parts)))
+
+
+def pick_runtime(device_type, runtimes):
+    """Newest available runtime that supports this device type."""
+    packed = lambda v: (v[0] << 16) | (v[1] << 8) | v[2]
+    candidates = []
+    for r in runtimes:
+        if not r.get("isAvailable"):
+            continue
+        supported = r.get("supportedDeviceTypes")
+        if supported is not None:
+            ok = any(t.get("identifier") == device_type["identifier"] for t in supported)
+        else:
+            version = packed(version_key(r.get("version")))
+            ok = (device_type.get("minRuntimeVersion", 0) <= version
+                  <= device_type.get("maxRuntimeVersion", 0xFFFFFFFF))
+        if ok:
+            candidates.append(r)
+    if not candidates:
+        raise Fail(f"no installed runtime supports {device_type['name']}", kind="no-runtime",
+                   next_step="install a runtime in Xcode > Settings > Components")
+    return max(candidates, key=lambda r: version_key(r.get("version")))["identifier"]
+
+
+def create_device(name, wanted_type):
+    types = json.loads(simctl("list", "devicetypes", "-j"))["devicetypes"]
+    matches = [t for t in types if wanted_type in (t["name"], t["identifier"])]
+    if not matches:
+        raise Fail(f"unknown device type {wanted_type!r}", EXIT_USAGE, "usage",
+                   "use a name or identifier from `xcrun simctl list devicetypes`")
+    runtime = pick_runtime(matches[0], list_runtimes())
+    log(f"creating {name} ({matches[0]['name']}, {runtime})")
+    return simctl("create", name, matches[0]["identifier"], runtime).strip()
+
+
+def poster_kb(udid):
+    """Allocated size of the PosterBoard store, like `du -sk`."""
+    total = 0
+    for root, dirs, files in os.walk(os.path.join(DEFAULT_SET, udid, POSTER_STORE)):
+        for entry in dirs + files:
+            try:
+                total += os.lstat(os.path.join(root, entry)).st_blocks * 512
+            except OSError:
+                pass
+    return total // 1024
+
+
+# -- vault ------------------------------------------------------------------------------
 
 def same_volume(a, b):
     return os.stat(a).st_dev == os.stat(b).st_dev
@@ -209,6 +323,68 @@ def read_meta(meta_path):
     return meta
 
 
+def write_json(path, data):
+    with open(path + ".partial", "w") as handle:
+        json.dump(data, handle, indent=2)
+    os.replace(path + ".partial", path)
+
+
+def safe_key(name):
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:60]
+    return f"{safe}-{hashlib.sha1(name.encode()).hexdigest()[:8]}"
+
+
+def record_path(name):
+    return os.path.join(RECORD_DIR, safe_key(name) + ".json")
+
+
+def save_record(name, meta):
+    """Local copy of the archive's identity, so a same-name blank device is still caught
+    (10) while the share is unmounted."""
+    try:
+        os.makedirs(RECORD_DIR, exist_ok=True)
+        write_json(record_path(name), {k: meta.get(k) for k in ("name", "udid", "restoredAs",
+                                                                "runtime", "parkedAt")})
+    except OSError as exc:
+        log(f"warning: could not keep a local record of the archive: {exc}")
+
+
+def archive_info(name, runtimes=None):
+    """(meta, info) of the archive. meta is None when there is none or it cannot be read;
+    info carries vaultError when the vault is unavailable, and source=local-record when
+    the identity comes from this Mac's record instead."""
+    try:
+        vault = vault_dir()
+        tar_path, meta_path = archive_paths(vault, name)
+        meta = read_meta(meta_path)
+        info = {"source": "vault"}
+        if meta is not None and not os.path.exists(tar_path):
+            info["error"] = "metadata without a tar"
+            meta = None
+    except Fail as exc:
+        if exc.code != EXIT_NO_VAULT:
+            return None, {"error": str(exc)}
+        info = {"vaultError": str(exc), "source": "local-record"}
+        try:
+            with open(record_path(name)) as handle:
+                meta = json.load(handle)
+        except (OSError, ValueError):
+            meta = None
+    if meta is None:
+        return None, dict(info, exists=False)
+    info.update(exists=True, udid=meta.get("udid"), restoredAs=meta.get("restoredAs"),
+                runtime=meta.get("runtime"),
+                runtimeAvailable=runtime_available(meta.get("runtime"), runtimes),
+                parkedAt=meta.get("parkedAt"), bytes=meta.get("bytes"), host=meta.get("host"))
+    return meta, info
+
+
+def matches_archive(udid, meta):
+    return None if meta is None else udid in (meta.get("udid"), meta.get("restoredAs"))
+
+
+# -- locks -----------------------------------------------------------------------------
+
 def pid_alive(pid):
     try:
         os.kill(pid, 0)
@@ -220,9 +396,7 @@ def pid_alive(pid):
 
 
 def lock_path(name):
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:60]
-    digest = hashlib.sha1(name.encode()).hexdigest()[:8]
-    return os.path.join(LOCK_DIR, f"{safe}-{digest}.lock")
+    return os.path.join(LOCK_DIR, safe_key(name) + ".lock")
 
 
 def read_holder(path):
@@ -240,10 +414,26 @@ def describe_holder(holder):
             f"in {holder.get('cwd')} since {holder.get('startedAt')}")
 
 
+def lock_holder(name):
+    """Holder info when the device lock is taken, else None. Does not keep the lock."""
+    path = lock_path(name)
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return read_holder(path) or {}
+    finally:
+        os.close(fd)   # closing drops a lock we may just have taken
+    return None
+
+
 class DeviceLock:
-    """Per-name flock. The kernel drops it when the holder dies, so there is nothing to
-    reclaim. The file is never deleted: a waiter holding the old inode would get in
-    alongside a newcomer on the new one."""
+    """Per-name flock. The kernel drops it when the holder and every child given the fd are
+    gone, so there is nothing to reclaim. The file is never deleted: a waiter holding the old
+    inode would get in alongside a newcomer on the new one."""
 
     def __init__(self, name, wait=DEFAULT_WAIT):
         self.name = name
@@ -265,7 +455,7 @@ class DeviceLock:
                     holder = read_holder(self.path)
                     os.close(fd)
                     raise Fail(f"'{self.name}' is in use by {describe_holder(holder)}; "
-                               f"waited {self.wait}s", EXIT_BUSY, "busy",
+                               f"waited {self.wait:g}s", EXIT_BUSY, "busy",
                                "wait for that process to finish, or pass a longer --wait; "
                                "if the same holder returns 8 twice, stop and report it")
                 time.sleep(0.2)
@@ -273,25 +463,142 @@ class DeviceLock:
         os.write(fd, json.dumps({"pid": os.getpid(), "argv": sys.argv, "cwd": os.getcwd(),
                                  "startedAt": now_iso()}).encode())
         self.fd = fd
+        HELD_FDS.append(fd)
         return self
 
     def __exit__(self, *exc):
         # Close only, never LOCK_UN: flock belongs to the open file description, which a
-        # child given the fd (tar in park) shares, and LOCK_UN would release it for that
-        # child too. Callers wait for or kill their children before leaving the block;
-        # a child still alive after an abrupt death of this process keeps the lock.
+        # child given the fd shares, and LOCK_UN would release it for that child too.
+        # Children are waited for or killed before this runs; one still alive after an
+        # abrupt death of this process keeps the lock until it exits.
+        HELD_FDS.remove(self.fd)
         os.close(self.fd)
 
 
-def now_iso():
-    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+def try_lock(name):
+    """Non-blocking DeviceLock for gc: an entered lock (leave it with __exit__), or None
+    when someone holds it."""
+    lock = DeviceLock(name, wait=0)
+    try:
+        return lock.__enter__()
+    except Fail:
+        return None
 
+
+def hold_busy_locks(templates, udid):
+    """Take each project lock file (flock) without waiting and keep it until park is done.
+    Files that do not exist are skipped: nobody can hold them."""
+    held = []
+    try:
+        for template in templates:
+            path = template.replace("{udid}", udid)
+            try:
+                fd = os.open(path, os.O_RDONLY)   # no create, no truncate
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise Fail(f"cannot open --busy-lock {path}: {exc}")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                raise Fail(f"{path} is held; the device is in use", EXIT_BUSY, "busy",
+                           "wait for that run to finish, then park again")
+            held.append(fd)
+            HELD_FDS.append(fd)
+    except BaseException:
+        release_fds(held)
+        raise
+    return held
+
+
+def release_fds(fds):
+    for fd in fds:
+        if fd in HELD_FDS:
+            HELD_FDS.remove(fd)
+        os.close(fd)
+
+
+# -- leases ----------------------------------------------------------------------------
+# A lease says "an owner is using this device across commands". Its file lives in
+# leases/<name key>/<owner sha1>.json. _boot.json in the same directory records that
+# `ensure --boot --lease` booted the device: the last lease released with --shutdown shuts
+# it down, whichever owner that is.
+
+def lease_dir(name):
+    return os.path.join(LEASE_DIR, safe_key(name))
+
+
+def lease_path(name, owner):
+    return os.path.join(lease_dir(name), hashlib.sha1(owner.encode()).hexdigest() + ".json")
+
+
+def boot_record_path(name):
+    return os.path.join(lease_dir(name), "_boot.json")
+
+
+def read_leases(name):
+    out = []
+    directory = lease_dir(name)
+    if not os.path.isdir(directory):
+        return out
+    for entry in sorted(os.listdir(directory)):
+        if entry.startswith("_") or not entry.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(directory, entry)) as handle:
+                lease = json.load(handle)
+            out.append(dict(lease, file=os.path.join(directory, entry)))
+        except (OSError, ValueError) as exc:
+            log(f"warning: unreadable lease {entry}: {exc}")
+    return out
+
+
+def read_boot_record(name):
+    try:
+        with open(boot_record_path(name)) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def remove_file(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def drop_stale_leases(name, present_udids):
+    """Leases and the boot record pointing at a device that no longer exists are left over
+    from a run that died (or a device parked by hand); drop them. Caller holds the lock."""
+    for lease in read_leases(name):
+        if lease.get("udid") not in present_udids:
+            log(f"dropping lease of {lease.get('owner')}: device {lease.get('udid')} is gone")
+            remove_file(lease["file"])
+    record = read_boot_record(name)
+    if record and record.get("udid") not in present_udids:
+        remove_file(boot_record_path(name))
+
+
+def lease_view(lease):
+    return {k: lease.get(k) for k in ("owner", "udid", "mode", "pid", "createdAt",
+                                      "updatedAt")}
+
+
+def describe_leases(leases):
+    return "; ".join(f"{l.get('owner')} ({l.get('mode')}, since {l.get('createdAt')}, "
+                     f"pid {l.get('pid')})" for l in leases)
+
+
+# -- quiet / archive helpers ----------------------------------------------------------
 
 def stream_into_tar(path, tar_args):
     """Read path once, feeding it to `tar <tar_args> -f -`; return (sha256, tar ok)."""
     digest = hashlib.sha256()
     proc = subprocess.Popen(["tar", *tar_args, "-f", "-"], stdin=subprocess.PIPE,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            pass_fds=tuple(HELD_FDS))
     try:
         tar_open = True
         with open(path, "rb") as handle:
@@ -351,129 +658,156 @@ def wait_until_quiet(device_dir):
         time.sleep(POLL)
 
 
-def write_json(path, data):
-    with open(path + ".partial", "w") as handle:
-        json.dump(data, handle, indent=2)
-    os.replace(path + ".partial", path)
-
-
-def overwrite_message(name, old, udid, runtimes):
-    if runtime_available(old.get("runtime"), runtimes):
+def overwrite_message(name, old, udid):
+    if runtime_available(old.get("runtime")):
         return (f"the archive of '{name}' came from another device ({old.get('udid')}), "
                 f"not {udid}; parking would replace it",
-                "restore that archive instead (delete this device first if it holds nothing "
-                "you need); pass --replace only to drop the archive on purpose")
+                "do not add --replace on your own: restore that archive instead (the local "
+                "device has to go first; check it holds nothing you need), or pass --replace "
+                "only once dropping the archive is decided")
     return (f"the archive of '{name}' came from another device ({old.get('udid')}) and its "
             f"runtime {old.get('runtime')} is gone, so it cannot be restored any more",
             "after checking nothing in that archive is needed, rerun with --replace")
 
 
-def park(name, shutdown, replace=False, wait=DEFAULT_WAIT):
+# -- park ------------------------------------------------------------------------------
+
+def park(name, shutdown=False, replace=False, wait=DEFAULT_WAIT, busy_locks=(),
+         missing_ok=False):
     vault = vault_dir()
     tar_path, meta_path = archive_paths(vault, name)
-    with DeviceLock(name, wait) as lock:
+    with DeviceLock(name, wait):
         device = find_one(name)
         if device is None:
+            if missing_ok:
+                log(f"no simulator named '{name}'; nothing to park")
+                return {"action": "absent", "udid": None}
             raise Fail(f"no simulator named '{name}'", kind="absent",
                        next_step="nothing to park; check the name with `xcrun simctl list "
-                                 "devices`")
+                                 "devices` (pass --missing-ok if absent is fine)")
         udid = device["udid"]
-        old = read_meta(meta_path)
-        if old is not None and not replace and udid not in (old.get("udid"),
-                                                            old.get("restoredAs")):
-            message, next_step = overwrite_message(name, old, udid, None)
-            raise Fail(message, EXIT_OVERWRITE, "overwrite", next_step)
-        state = device["state"]
-        if state in ("Booted", "Booting"):
-            if not shutdown:
-                raise Fail(f"'{name}' is {state}", EXIT_BOOTED, "booted",
-                           "shut it down first, or pass --shutdown if the project allows it")
-            log(f"shutting down {name}")
-            simctl("shutdown", udid)
-            wait_for_shutdown(udid)
-        elif state == "Shutting Down":
-            log(f"{name} is shutting down; waiting")
-            wait_for_shutdown(udid)
-        elif state != "Shutdown":
-            raise Fail(f"'{name}' is {state}", next_step="wait until it is Shutdown, then rerun")
-        device_dir = os.path.join(DEFAULT_SET, udid)
-        wait_until_quiet(device_dir)
-        with open(os.path.join(device_dir, "device.plist"), "rb") as handle:
-            plist = plistlib.load(handle)
-
-        partial = tar_path + ".partial"
-        started = time.time()
-        log(f"archiving {name} ({udid}) to {tar_path}")
-        digest = hashlib.sha256()
-        size = 0
-        proc = None
+        drop_stale_leases(name, {d["udid"] for d in all_devices()})
+        leases = read_leases(name)
+        if leases:
+            raise Fail(f"'{name}' is leased by {describe_leases(leases)}", EXIT_BUSY, "busy",
+                       "wait for those runs to finish; if a lease is left over from a run that "
+                       f"died, `sim-vault release '{name}' --lease <owner>`")
+        held = hold_busy_locks(busy_locks, udid)
         try:
-            # tar inherits the lock: if this process dies mid-archive, nobody else gets in
-            # until tar stops writing.
-            proc = subprocess.Popen(["tar", "-C", DEFAULT_SET, "-cf", "-", udid],
-                                    stdout=subprocess.PIPE, pass_fds=(lock.fd,))
-            with open(partial, "wb") as out:
-                for chunk in iter(lambda: proc.stdout.read(CHUNK), b""):
-                    digest.update(chunk)
-                    out.write(chunk)
-                    size += len(chunk)
-                out.flush()
-                os.fsync(out.fileno())
-            if proc.wait() != 0:
-                raise Fail("tar failed while archiving; the simulator was kept")
-            written = digest.hexdigest()
-            # One read-back pass checks both the bytes and that tar can walk the archive:
-            # a matching checksum alone passed a broken archive in testing.
-            read_back, readable = stream_into_tar(partial, ["-t"])
-            if os.path.getsize(partial) != size or read_back != written or not readable:
-                raise Fail("archive read back from the vault is not intact; "
-                           "the simulator was kept")
-            # Someone may have booted the device while tar was reading it; the archive would
-            # then be torn. Check before it replaces the previous one.
-            state = device_state(udid)
-            latest, path = newest_mtime(device_dir, time.time())
-            if state != "Shutdown" or latest >= started:
-                raise Fail(f"'{name}' changed while it was being archived (now {state}; "
-                           f"latest write {path}); the old archive and the device were kept",
-                           EXIT_BUSY, "busy", "let whoever uses it finish, then park again")
-            meta = {
-                "name": name,
-                "udid": udid,
-                "runtime": plist.get("runtime"),
-                "deviceType": plist.get("deviceType"),
-                "sha256": written,
-                "bytes": size,
-                "parkedAt": now_iso(),
-                "host": socket.gethostname(),
-                "toolVersion": TOOL_VERSION,
-            }
-            with open(meta_path + ".partial", "w") as handle:
-                json.dump(meta, handle, indent=2)
-            # Replace the previous archive only after the new one is verified.
-            os.replace(partial, tar_path)
-            os.replace(meta_path + ".partial", meta_path)
-        except BaseException:
-            if proc is not None and proc.poll() is None:
-                proc.kill()
-                proc.wait()
-            for leftover in (partial, meta_path + ".partial"):
-                if os.path.exists(leftover):
-                    os.remove(leftover)
-            raise
+            result = park_locked(name, device, tar_path, meta_path, shutdown, replace)
+        finally:
+            release_fds(held)
+        remove_file(boot_record_path(name))
+        return result
+
+
+def park_locked(name, device, tar_path, meta_path, shutdown, replace):
+    udid = device["udid"]
+    old = read_meta(meta_path)
+    if old is not None and not replace and udid not in (old.get("udid"),
+                                                        old.get("restoredAs")):
+        message, next_step = overwrite_message(name, old, udid)
+        raise Fail(message, EXIT_OVERWRITE, "overwrite", next_step)
+    state = device["state"]
+    if state in ("Booted", "Booting") and not shutdown:
+        raise Fail(f"'{name}' is {state}", EXIT_BOOTED, "booted",
+                   "shut it down first, or pass --shutdown if the project allows it")
+    poster = poster_kb(udid)
+    log(f"PosterBoard data: {poster // 1024} MB")
+    if poster > POSTER_LIMIT_KB:
+        raise Fail(f"PosterBoard data of '{name}' is {poster // 1024} MB (limit "
+                   f"{POSTER_LIMIT_KB // 1024} MB); it would go into the archive and come "
+                   "back on every restore", EXIT_POSTER, "posterboard-bloated",
+                   "rebuild the PosterBoard data (modern-ios-guidance, PosterBoard section), "
+                   "then park again; the device was not touched")
+    if state in ("Booted", "Booting"):
+        log(f"shutting down {name}")
+        shutdown_device(udid)
+    elif state == "Shutting Down":
+        log(f"{name} is shutting down; waiting")
+        wait_for_shutdown(udid)
+    elif state != "Shutdown":
+        raise Fail(f"'{name}' is {state}", next_step="wait until it is Shutdown, then rerun")
+    device_dir = os.path.join(DEFAULT_SET, udid)
+    wait_until_quiet(device_dir)
+    with open(os.path.join(device_dir, "device.plist"), "rb") as handle:
+        plist = plistlib.load(handle)
+
+    partial = tar_path + ".partial"
+    started = time.time()
+    log(f"archiving {name} ({udid}) to {tar_path}")
+    digest = hashlib.sha256()
+    size = 0
+    proc = None
+    try:
+        proc = subprocess.Popen(["tar", "-C", DEFAULT_SET, "-cf", "-", udid],
+                                stdout=subprocess.PIPE, pass_fds=tuple(HELD_FDS))
+        with open(partial, "wb") as out:
+            for chunk in iter(lambda: proc.stdout.read(CHUNK), b""):
+                digest.update(chunk)
+                out.write(chunk)
+                size += len(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+        if proc.wait() != 0:
+            raise Fail("tar failed while archiving; the simulator was kept")
+        written = digest.hexdigest()
+        # One read-back pass checks both the bytes and that tar can walk the archive:
+        # a matching checksum alone passed a broken archive in testing.
+        read_back, readable = stream_into_tar(partial, ["-t"])
+        if os.path.getsize(partial) != size or read_back != written or not readable:
+            raise Fail("archive read back from the vault is not intact; "
+                       "the simulator was kept")
+        # Someone may have booted the device while tar was reading it; the archive would
+        # then be torn. Check before it replaces the previous one.
         state = device_state(udid)
-        if state != "Shutdown":
-            raise Fail(f"'{name}' was archived but is now {state}; the device was not deleted",
-                       EXIT_BUSY, "busy", "the new archive is good; park again once it is "
-                                          "no longer in use")
-        simctl("delete", udid)
-        log(f"parked {name}: {size / 1e9:.2f} GB in {time.time() - started:.0f}s; device deleted")
-        return {"action": "parked", "udid": udid, "bytes": size}
+        latest, path = newest_mtime(device_dir, time.time())
+        if state != "Shutdown" or latest >= started:
+            raise Fail(f"'{name}' changed while it was being archived (now {state}; "
+                       f"latest write {path}); the old archive and the device were kept",
+                       EXIT_BUSY, "busy", "let whoever uses it finish, then park again")
+        meta = {
+            "name": name,
+            "udid": udid,
+            "runtime": plist.get("runtime"),
+            "deviceType": plist.get("deviceType"),
+            "sha256": written,
+            "bytes": size,
+            "parkedAt": now_iso(),
+            "host": socket.gethostname(),
+            "toolVersion": TOOL_VERSION,
+        }
+        with open(meta_path + ".partial", "w") as handle:
+            json.dump(meta, handle, indent=2)
+        # Replace the previous archive only after the new one is verified.
+        os.replace(partial, tar_path)
+        os.replace(meta_path + ".partial", meta_path)
+    except BaseException:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for leftover in (partial, meta_path + ".partial"):
+            if os.path.exists(leftover):
+                os.remove(leftover)
+        raise
+    save_record(name, meta)
+    state = device_state(udid)
+    if state != "Shutdown":
+        raise Fail(f"'{name}' was archived but is now {state}; the device was not deleted",
+                   EXIT_BUSY, "busy", "the new archive is good; park again once it is "
+                                      "no longer in use")
+    simctl("delete", udid)
+    log(f"parked {name}: {size / 1e9:.2f} GB in {time.time() - started:.0f}s; device deleted")
+    return {"action": "parked", "udid": udid, "bytes": size, "posterMB": poster // 1024}
 
 
-def remove_stale_restoring(name):
-    """Delete devices left as '<name> [sim-vault restoring <pid>]' by a dead restore."""
+# -- restore / ensure ------------------------------------------------------------------
+
+def remove_stale_restoring(name, devices=None):
+    """Delete devices left as '<name> [sim-vault restoring <pid>]' by a dead restore.
+    Caller holds the device lock, so no restore of this name is running."""
     prefix = name + RESTORING
-    for device in all_devices():
+    for device in devices if devices is not None else all_devices():
         if not device["name"].startswith(prefix):
             continue
         match = re.match(r"(\d+)\]$", device["name"][len(prefix):])
@@ -482,44 +816,33 @@ def remove_stale_restoring(name):
             simctl("delete", device["udid"])
 
 
-def compare_with_archive(udid, name):
-    """(matches, archive info) for a local device. matches is None when there is nothing
-    to compare against (no archive, vault unavailable, unreadable metadata)."""
-    try:
-        vault = vault_dir()
-        tar_path, meta_path = archive_paths(vault, name)
-        meta = read_meta(meta_path)
-    except Fail as exc:
-        log(f"warning: cannot compare with the archive: {exc}")
-        return None, {"vaultError": str(exc)}
-    if meta is None or not os.path.exists(tar_path):
-        return None, {"exists": False}
-    info = {"exists": True, "udid": meta.get("udid"), "restoredAs": meta.get("restoredAs"),
-            "runtime": meta.get("runtime"), "runtimeAvailable": runtime_available(
-                meta.get("runtime")), "parkedAt": meta.get("parkedAt"),
-            "bytes": meta.get("bytes"), "host": meta.get("host")}
-    return udid in (meta.get("udid"), meta.get("restoredAs")), info
+def not_archived_fail(name, existing, info):
+    where = ("this Mac's record of the archive (the vault is unavailable)"
+             if info.get("source") == "local-record" else "the archive")
+    return Fail(f"'{name}' exists locally ({existing['udid']}) but is not the device in "
+                f"{where} ({info.get('udid')}), which can still be restored",
+                EXIT_NOT_ARCHIVED, "not-archived-device",
+                "stop and report this; do not delete or park anything on your own. "
+                "Once the owner decides: to use the archive and keep the local device, "
+                f"`xcrun simctl rename {existing['udid']} '<other name>'` and rerun; to "
+                "use the archive and drop the local device, `xcrun simctl delete "
+                f"{existing['udid']}` and rerun; to keep the local device and drop the "
+                f"archive, `sim-vault park '{name}' --replace`")
 
 
-def restore_locked(name):
+def restore_locked(name, warnings=None):
     """Restore without taking the lock (the caller holds it). Returns a result dict."""
     remove_stale_restoring(name)
-    existing = find_one(name)
+    existing = find_one(name, warnings)
     if existing is not None:
-        matches, archive = compare_with_archive(existing["udid"], name)
-        if matches is False and archive.get("runtimeAvailable"):
-            raise Fail(f"'{name}' exists locally ({existing['udid']}) but is not the archived "
-                       f"device ({archive.get('udid')}), which can still be restored",
-                       EXIT_NOT_ARCHIVED, "not-archived-device",
-                       "stop and report this; do not delete or park anything on your own. "
-                       "Once the owner decides: to use the archive and keep the local device, "
-                       f"`xcrun simctl rename {existing['udid']} '<other name>'` and rerun; to "
-                       "use the archive and drop the local device, `xcrun simctl delete "
-                       f"{existing['udid']}` and rerun; to keep the local device and drop the "
-                       f"archive, `sim-vault park '{name}' --replace`")
+        meta, info = archive_info(name)
+        matches = matches_archive(existing["udid"], meta)
+        if matches is False and info.get("runtimeAvailable"):
+            raise not_archived_fail(name, existing, info)
         log(f"{name} already exists, nothing to restore")
         return {"action": "existing", "udid": existing["udid"], "state": existing["state"],
-                "matchesArchive": matches, "archive": archive}
+                "matchesArchive": matches, "archive": info,
+                "needsReplaceOnFirstPark": matches is False}
     vault = vault_dir()
     tar_path, meta_path = archive_paths(vault, name)
     meta = read_meta(meta_path)
@@ -529,10 +852,13 @@ def restore_locked(name):
     if not runtime_available(meta.get("runtime")):
         raise Fail(f"runtime {meta.get('runtime')} is not installed", EXIT_NO_RUNTIME,
                    "runtime-missing", "create the device if the project's policy allows it; "
-                                      "its first park then needs --replace")
+                                      "its first park then returns 7 and needs --replace")
     host = socket.gethostname()
     if meta.get("host") and meta["host"] != host:
-        log(f"warning: this archive was parked on {meta['host']}, not {host}")
+        message = f"this archive was parked on {meta['host']}, not {host}"
+        log(f"warning: {message}")
+        if warnings is not None:
+            warnings.append(message)
 
     started = time.time()
     os.makedirs(STAGING_ROOT, exist_ok=True)
@@ -568,10 +894,9 @@ def restore_locked(name):
             simctl("delete", meta["udid"], device_set=staging)
         except Fail as exc:
             log(f"warning: could not unregister staging copy: {exc}")
-        # Record the new UDID before the rename, so a finished restore always has it and a
-        # later park of this device may replace its own archive.
-        # Without it the restored device looks foreign to its own archive (park 7,
-        # restore 10), so a failed write aborts the restore.
+        # Without restoredAs the restored device looks foreign to its own archive (park 7,
+        # restore 10), so a failed write aborts the restore. It is written before the
+        # rename, so a finished restore always has it.
         meta["restoredAs"] = udid
         try:
             write_json(meta_path, meta)
@@ -590,21 +915,159 @@ def restore_locked(name):
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+    save_record(name, meta)
     log(f"restored {name} as {udid} in {time.time() - started:.0f}s "
         f"(archive kept at {tar_path})")
-    return {"action": "restored", "udid": udid, "state": "Shutdown", "matchesArchive": True}
+    return {"action": "restored", "udid": udid, "state": "Shutdown", "matchesArchive": True,
+            "needsReplaceOnFirstPark": False,
+            "archive": {"source": "vault", "exists": True, "udid": meta.get("udid"),
+                        "restoredAs": udid, "runtime": meta.get("runtime"),
+                        "runtimeAvailable": True, "parkedAt": meta.get("parkedAt"),
+                        "bytes": meta.get("bytes"), "host": meta.get("host")}}
 
 
 def restore(name, wait=DEFAULT_WAIT):
+    warnings = []
     with DeviceLock(name, wait):
-        return restore_locked(name)
+        result = restore_locked(name, warnings)
+    result["warnings"] = warnings
+    return result
+
+
+def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFAULT_WAIT):
+    warnings = []
+    with DeviceLock(name, wait):
+        try:
+            result = restore_locked(name, warnings)
+        except Fail as exc:
+            if exc.code not in (EXIT_NO_ARCHIVE, EXIT_NO_RUNTIME) or not create:
+                raise
+            udid = create_device(name, create)
+            result = {"action": "created", "udid": udid, "state": "Shutdown",
+                      "matchesArchive": None if exc.code == EXIT_NO_ARCHIVE else False,
+                      "needsReplaceOnFirstPark": exc.code == EXIT_NO_RUNTIME,
+                      "archive": {"exists": exc.code == EXIT_NO_RUNTIME}}
+        udid = result["udid"]
+        present = {d["udid"] for d in all_devices()}
+        drop_stale_leases(name, present)
+        leases = read_leases(name)
+        mine = [l for l in leases if l.get("owner") == lease] if lease else []
+        others = [l for l in leases if not lease or l.get("owner") != lease]
+        blocking = [l for l in others if exclusive or l.get("mode") == "exclusive"]
+        if blocking:
+            raise Fail(f"'{name}' is leased by {describe_leases(blocking)}", EXIT_BUSY, "busy",
+                       "wait for that run to finish; if its lease is left over from a run "
+                       f"that died, `sim-vault release '{name}' --lease <owner>`")
+        state = device_state(udid)
+        reentry = bool(mine) and mine[0].get("udid") == udid
+        if exclusive and not reentry and state != "Shutdown":
+            raise Fail(f"'{name}' is {state} but has no lease: someone outside sim-vault is "
+                       "using it", EXIT_BUSY, "busy",
+                       "find who booted it (an open xcodebuild, a manual session), let them "
+                       "finish and shut it down, then rerun")
+        lease_file, wrote_new = None, False
+        if lease:
+            lease_file = lease_path(name, lease)
+            stamp = now_iso()
+            if reentry:
+                record = dict(mine[0], updatedAt=stamp,
+                              mode="exclusive" if exclusive else mine[0].get("mode"))
+                record.pop("file", None)
+            else:
+                record = {"owner": lease, "udid": udid, "pid": os.getppid(), "createdAt": stamp,
+                          "updatedAt": stamp, "mode": "exclusive" if exclusive else "shared"}
+                wrote_new = True
+            os.makedirs(lease_dir(name), exist_ok=True)
+            # The lease goes in before booting, so a device we boot always has an owner.
+            write_json(lease_file, record)
+        try:
+            booted_by_us = False
+            if boot:
+                state = device_state(udid)
+                if state == "Shutting Down":
+                    state = wait_for_shutdown(udid)
+                if state == "Shutdown":
+                    log(f"booting {name}")
+                    simctl("boot", udid, timeout=STATE_TIMEOUT)
+                    booted_by_us = True
+                    if lease:
+                        write_json(boot_record_path(name), {"udid": udid, "by": lease,
+                                                            "at": now_iso()})
+                # Booting devices too: return only once it is usable.
+                simctl("bootstatus", udid, "-b", timeout=BOOT_TIMEOUT)
+        except BaseException:
+            if wrote_new:
+                remove_file(lease_file)
+            raise
+        if result.get("matchesArchive") is False and result["action"] == "existing":
+            warnings.append("this device is not the archived one (the archive's runtime is "
+                            "gone); its first park returns 7 and needs --replace")
+        result.update(name=name, state=device_state(udid), bootedByUs=booted_by_us,
+                      lease=lease, warnings=warnings)
+        return result
+
+
+def release(name, lease, shutdown=False, wait=DEFAULT_WAIT):
+    with DeviceLock(name, wait):
+        present = {d["udid"] for d in all_devices()}
+        drop_stale_leases(name, present)
+        path = lease_path(name, lease)
+        others = [l for l in read_leases(name) if l.get("owner") != lease]
+        record = read_boot_record(name)
+        did_shutdown = False
+        if shutdown and not others and record:
+            # The lease stays until the device is down, so a failed shutdown can be rerun.
+            log(f"shutting down {name} (booted by ensure for {record.get('by')})")
+            shutdown_device(record["udid"])
+            remove_file(boot_record_path(name))
+            did_shutdown = True
+        elif shutdown and others:
+            log(f"not shutting down: still leased by {describe_leases(others)}")
+        elif shutdown:
+            log("not shutting down: sim-vault did not boot it under a lease")
+        existed = os.path.exists(path)
+        remove_file(path)
+        return {"action": "released" if existed else "no-lease", "lease": lease,
+                "shutdown": did_shutdown, "remaining": [lease_view(l) for l in others]}
+
+
+# -- status / list / gc -----------------------------------------------------------------
+
+def status(name):
+    devices = all_devices()
+    matches = [d for d in devices if d["name"] == name]
+    available = [d for d in matches if d.get("isAvailable", True)]
+    runtimes = list_runtimes()
+    meta, info = archive_info(name, runtimes)
+    present = {d["udid"] for d in devices}
+    leases = read_leases(name)
+    one = available[0] if len(available) == 1 else None
+    holder = lock_holder(name)
+    restoring = [d["name"] for d in devices if d["name"].startswith(name + RESTORING)]
+    return {
+        "name": name,
+        "udid": one["udid"] if one else None,
+        "state": one["state"] if one else None,
+        "count": len(available),
+        "unavailableCount": len(matches) - len(available),
+        "devices": [{"udid": d["udid"], "state": d["state"], "runtime": d["runtime"]}
+                    for d in available],
+        "archive": info,
+        "matchesArchive": matches_archive(one["udid"], meta) if one else None,
+        "leases": [dict(lease_view(l), stale=l.get("udid") not in present) for l in leases],
+        "bootedByLease": read_boot_record(name),
+        "lock": {"held": holder is not None, "holder": holder},
+        "posterMB": poster_kb(one["udid"]) // 1024 if one else None,
+        "restoringLeftovers": restoring,
+    }
 
 
 def list_archives():
     vault = vault_dir()
-    runtimes = json.loads(simctl("list", "runtimes", "-j"))["runtimes"]
-    archives, errors = [], []
-    for entry in sorted(os.listdir(vault)):
+    runtimes = list_runtimes()
+    archives, errors, names = [], [], set()
+    entries = sorted(os.listdir(vault))
+    for entry in entries:
         # ._* are AppleDouble files the SMB client leaves next to real ones.
         if not entry.endswith(".json") or entry.startswith("._"):
             continue
@@ -612,57 +1075,280 @@ def list_archives():
         try:
             meta = read_meta(path)
             runtime = meta.get("runtime") or "?"
-            archives.append(dict(meta, runtimeAvailable=runtime_available(runtime, runtimes)))
+            archives.append(dict(meta, runtimeAvailable=runtime_available(runtime, runtimes),
+                                 hasTar=os.path.exists(path[:-5] + ".tar")))
+            names.add(entry[:-5])
         except Fail as exc:
             errors.append({"file": entry, "error": str(exc)})
             log(f"error: {exc}")
-    for meta in archives:
+    orphans = [e for e in entries if e.endswith(".tar") and not e.startswith("._")
+               and e[:-4] not in names]
+    return {"archives": archives, "errors": errors, "orphanTars": orphans}
+
+
+def print_list(result):
+    for meta in result["archives"]:
         runtime = meta.get("runtime") or "?"
-        status = "ok" if meta["runtimeAvailable"] else "runtime missing"
+        status_text = "ok" if meta["runtimeAvailable"] else "runtime missing"
         print(f"{meta.get('name')}\t{(meta.get('bytes') or 0) / 1e9:.2f} GB\t"
-              f"{meta.get('parkedAt')}\t{runtime.rsplit('.', 1)[-1]}\t{status}")
-    return {"archives": archives, "errors": errors}
+              f"{meta.get('parkedAt')}\t{runtime.rsplit('.', 1)[-1]}\t{status_text}")
+
+
+def parse_age(text):
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", text.strip())
+    if not match:
+        raise argparse.ArgumentTypeError(f"bad duration {text!r} (examples: 90m, 24h, 2d)")
+    return float(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[
+        match.group(2)]
+
+
+def gc(dry_run=False, leases_older_than=86400, prefix=None):
+    deleted, attention = [], []
+    wanted = (lambda n: n is not None and n.startswith(prefix)) if prefix else (lambda n: True)
+
+    def act(kind, what, fn):
+        deleted.append({"kind": kind, "what": what})
+        log(f"{'would delete' if dry_run else 'deleting'} {kind}: {what}")
+        if not dry_run:
+            fn()
+
+    devices = all_devices()
+    # Half-restored devices and staging sets: only under the name's lock, so a restore
+    # still running (or a child of a killed one still holding the lock) is left alone.
+    by_name = {}
+    for device in devices:
+        if RESTORING in device["name"]:
+            by_name.setdefault(device["name"].split(RESTORING)[0], []).append(device)
+    staging_sets = []
+    if os.path.isdir(STAGING_ROOT):
+        for entry in sorted(os.listdir(STAGING_ROOT)):
+            path = os.path.join(STAGING_ROOT, entry)
+            owner = read_holder(os.path.join(path, "owner.json")) or {}
+            staging_sets.append((owner.get("name"), owner.get("pid"), path))
+    names = set(by_name) | {n for n, _p, _s in staging_sets if n}
+    for name in sorted(n for n in names if wanted(n)):
+        lock = try_lock(name)
+        if lock is None:
+            attention.append({"kind": "busy", "what": name, "note": "lock held; skipped"})
+            continue
+        try:
+            for device in by_name.get(name, []):
+                match = re.search(r"restoring (\d+)\]$", device["name"])
+                if match and pid_alive(int(match.group(1))):
+                    continue
+                act("restoring-device", f"{device['name']} ({device['udid']})",
+                    lambda u=device["udid"]: simctl("delete", u))
+            for owner_name, pid, path in staging_sets:
+                if owner_name == name and not (pid and pid_alive(pid)):
+                    act("staging", path, lambda p=path: shutil.rmtree(p, ignore_errors=True))
+        finally:
+            lock.__exit__(None, None, None)
+    for owner_name, _pid, path in staging_sets:
+        if owner_name is None and not prefix:
+            attention.append({"kind": "staging", "what": path, "note": "no owner.json"})
+    # The old staging path has no pid or owner, and the old sim-vault may be restoring into
+    # it right now: only sets untouched for an hour, and only when a name filter is not in
+    # force (the device name inside is the only way to attribute them).
+    if os.path.isdir(LEGACY_STAGING_ROOT) and not prefix:
+        for entry in sorted(os.listdir(LEGACY_STAGING_ROOT)):
+            path = os.path.join(LEGACY_STAGING_ROOT, entry)
+            latest, _ = newest_mtime(path, time.time())
+            age = time.time() - max(latest, os.lstat(path).st_mtime)
+            if age > STALE_AFTER:
+                act("legacy-staging", path, lambda p=path: shutil.rmtree(p, ignore_errors=True))
+            else:
+                attention.append({"kind": "legacy-staging", "what": path,
+                                  "note": "touched within the hour; maybe an old restore"})
+    # Vault leftovers.
+    try:
+        vault = vault_dir()
+        entries = sorted(e for e in os.listdir(vault) if not e.startswith("._"))
+    except Fail as exc:
+        attention.append({"kind": "vault", "what": str(exc)})
+        entries, vault = [], None
+    for entry in entries:
+        path = os.path.join(vault, entry)
+        if entry.endswith(".partial"):
+            name = re.sub(r"\.(tar|json)\.partial$", "", entry)
+            if not wanted(name):
+                continue
+            if time.time() - os.lstat(path).st_mtime < STALE_AFTER:
+                attention.append({"kind": "partial", "what": path, "note": "younger than 1h"})
+                continue
+            lock = try_lock(name)
+            if lock is None:
+                attention.append({"kind": "partial", "what": path, "note": "lock held"})
+                continue
+            try:
+                act("partial", path, lambda p=path: remove_file(p))
+            finally:
+                lock.__exit__(None, None, None)
+        elif entry.endswith((".tar", ".json")):
+            stem, other = (entry[:-4], ".json") if entry.endswith(".tar") else (entry[:-5],
+                                                                                ".tar")
+            if wanted(stem) and stem + other not in entries:
+                attention.append({"kind": "unpaired", "what": path,
+                                  "note": f"no {stem}{other}"})
+    # Leases: listed, never deleted (a run may legitimately last hours).
+    if os.path.isdir(LEASE_DIR):
+        present = {d["udid"] for d in devices}
+        for key in sorted(os.listdir(LEASE_DIR)):
+            directory = os.path.join(LEASE_DIR, key)
+            for entry in sorted(os.listdir(directory)):
+                if entry.startswith("_") or not entry.endswith(".json"):
+                    continue
+                lease = read_holder(os.path.join(directory, entry)) or {}
+                name = next((d["name"] for d in devices if d["udid"] == lease.get("udid")),
+                            None)
+                if prefix and not (wanted(name) or key.startswith(safe_key(prefix)[:len(
+                        prefix)])):
+                    continue
+                age = time.time() - os.lstat(os.path.join(directory, entry)).st_mtime
+                if lease.get("udid") not in present or age > leases_older_than:
+                    attention.append({"kind": "lease", "what": lease.get("owner"),
+                                      "device": name or key, "udid": lease.get("udid"),
+                                      "createdAt": lease.get("createdAt"),
+                                      "note": "device gone" if lease.get("udid") not in present
+                                      else f"older than {leases_older_than / 3600:g}h"})
+    for item in attention:
+        log(f"attention: {item}")
+    return {"dryRun": dry_run, "deleted": deleted, "attention": attention}
+
+
+# -- CLI -------------------------------------------------------------------------------
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise Fail(f"{self.prog}: {message}", EXIT_USAGE, "usage",
+                   f"see `{self.prog} --help`")
+
+
+def build_parser():
+    parser = Parser(prog="sim-vault", description=__doc__,
+                    formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
+
+    def add(name, text):
+        p = sub.add_parser(name, help=text, description=text)
+        p.add_argument("--json", action="store_true",
+                       help="print one JSON object on stdout, also on failure")
+        return p
+
+    def wait_flag(p):
+        p.add_argument("--wait", type=float, default=DEFAULT_WAIT,
+                       help="seconds to wait for the device lock (default 60), then exit 8")
+
+    p = add("status", "what is local, archived and leased for <name>; takes no lock; exit 0")
+    p.add_argument("name")
+    p = add("ensure", "make <name> available: local device, else restore, else create "
+                      "(with --create on 3/4); prints the UDID")
+    p.add_argument("name")
+    p.add_argument("--create", metavar="TYPE",
+                   help="on 3/4, create it with this device type (name or identifier) and the "
+                        "newest installed runtime that supports it")
+    p.add_argument("--boot", action="store_true",
+                   help="boot it unless running, and wait until it has finished booting")
+    p.add_argument("--lease", metavar="OWNER",
+                   help="register OWNER as using the device until `release`; park refuses "
+                        "(8) while any lease exists. Recorded before booting")
+    p.add_argument("--exclusive", action="store_true",
+                   help="with --lease: refuse (8) if another owner holds a lease or the "
+                        "device runs without one, and make later ensures by others refuse")
+    wait_flag(p)
+    p = add("restore", "bring <name> back from the vault; never creates or boots; "
+                       "prints the UDID")
+    p.add_argument("name")
+    wait_flag(p)
+    p = add("park", "archive <name>, verify it, then delete the device")
+    p.add_argument("name")
+    p.add_argument("--shutdown", action="store_true",
+                   help="shut the device down first if it is booted (project policy)")
+    p.add_argument("--replace", action="store_true",
+                   help="replace an archive that came from a different device")
+    p.add_argument("--busy-lock", action="append", default=[], metavar="FILE",
+                   help="a project flock file meaning 'in use'; {udid} is substituted. Taken "
+                        "without waiting (held: exit 8) and kept until park ends. Repeatable")
+    p.add_argument("--missing-ok", action="store_true",
+                   help="exit 0 when there is no such device")
+    wait_flag(p)
+    p = add("release", "drop OWNER's lease on <name>; exit 0 when there is none")
+    p.add_argument("name")
+    p.add_argument("--lease", metavar="OWNER", required=True)
+    p.add_argument("--shutdown", action="store_true",
+                   help="if this is the last lease and `ensure --boot --lease` booted the "
+                        "device, shut it down and wait; the lease is removed only after that")
+    wait_flag(p)
+    add("list", "archives in the vault (bad or AppleDouble files are skipped and reported)")
+    p = add("gc", "delete what interrupted runs left: half-restored devices, staging sets, "
+                  "stale .partial files; list unpaired archives and old leases")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--leases-older-than", type=parse_age, default=86400, metavar="AGE",
+                   help="list leases older than AGE (default 24h); they are never deleted")
+    p.add_argument("--name-prefix", metavar="TEXT", help="only names starting with TEXT")
+    return parser
+
+
+def emit(as_json, payload):
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False))
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Park iOS simulators on another volume and restore them ready to use.")
-    sub = parser.add_subparsers(dest="command", required=True)
-    p_park = sub.add_parser("park", help="archive, verify, then delete the device")
-    p_park.add_argument("name")
-    p_park.add_argument("--shutdown", action="store_true",
-                        help="shut the device down first if it is booted")
-    p_park.add_argument("--replace", action="store_true",
-                        help="replace an archive that came from a different device")
-    p_restore = sub.add_parser("restore", help="restore the device and print its UDID")
-    p_restore.add_argument("name")
-    for p in (p_park, p_restore):
-        p.add_argument("--wait", type=float, default=DEFAULT_WAIT,
-                       help="seconds to wait for the device lock (default 60); then exit 8")
-    sub.add_parser("list", help="list archives in the vault")
-    args = parser.parse_args()
+    as_json = "--json" in sys.argv[1:]
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGHUP, on_signal)
     try:
-        if args.command == "park":
-            park(args.name, args.shutdown, args.replace, args.wait)
+        args = build_parser().parse_args()
+        if getattr(args, "exclusive", False) and not args.lease:
+            raise Fail("--exclusive needs --lease", EXIT_USAGE, "usage",
+                       "pass --lease <owner> so the exclusivity outlives this command")
+        if args.command == "status":
+            result = status(args.name)
+            if not as_json and result["udid"]:
+                print(result["udid"])
+        elif args.command == "ensure":
+            result = ensure(args.name, args.create, args.boot, args.lease, args.exclusive,
+                            args.wait)
+            if not as_json:
+                print(result["udid"])
         elif args.command == "restore":
-            print(restore(args.name, args.wait)["udid"])
+            result = restore(args.name, args.wait)
+            if not as_json:
+                print(result["udid"])
+        elif args.command == "park":
+            result = park(args.name, args.shutdown, args.replace, args.wait, args.busy_lock,
+                          args.missing_ok)
+        elif args.command == "release":
+            result = release(args.name, args.lease, args.shutdown, args.wait)
+        elif args.command == "list":
+            result = list_archives()
+            if not as_json:
+                print_list(result)
         else:
-            list_archives()
+            result = gc(args.dry_run, args.leases_older_than, args.name_prefix)
+        emit(as_json, dict({"ok": True}, **result))
     except Fail as exc:
         log(f"error: {exc}")
         if exc.next_step:
             log(f"next: {exc.next_step}")
+        emit(as_json, {"ok": False, "code": exc.code, "kind": exc.kind, "message": str(exc),
+                       "next": exc.next_step})
         sys.exit(exc.code)
     except Interrupted as exc:
         log(f"interrupted by signal {exc.signum}; cleaned up")
+        emit(as_json, {"ok": False, "code": 128 + exc.signum, "kind": "interrupted",
+                       "message": f"signal {exc.signum}", "next": "rerun"})
         sys.exit(128 + exc.signum)
     except KeyboardInterrupt:
         log("interrupted; cleaned up")
+        emit(as_json, {"ok": False, "code": 130, "kind": "interrupted",
+                       "message": "SIGINT", "next": "rerun"})
         sys.exit(130)
     except Exception as exc:  # no traceback: agents read it as a cue to guess
         log(f"error: unexpected {type(exc).__name__}: {exc}")
+        emit(as_json, {"ok": False, "code": EXIT_ERROR, "kind": "unexpected",
+                       "message": f"{type(exc).__name__}: {exc}",
+                       "next": "stop and report this message"})
         sys.exit(EXIT_ERROR)
 
 
