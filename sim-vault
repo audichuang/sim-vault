@@ -13,7 +13,8 @@ commands (see `sim-vault <command> --help` for flags):
                    (probes the device lock for an instant); 0 unless simctl fails
   ensure <name>    use the local device, else restore it, else (3/4 with --create) create it;
                    optionally --boot and register a --lease; prints the UDID
-  restore <name>   `ensure` without policy: never creates or boots; prints the UDID
+  restore <name>   `ensure` without policy, for people and old scripts: never creates or
+                   boots, ignores leases; prints the UDID. Callers using leases use ensure
   park <name>      archive, verify, then delete the device (refuses while it is in use)
   release <name>   drop a lease; with --shutdown the last lease shuts down what ensure booted
   list             archives in the vault
@@ -40,7 +41,7 @@ exit codes and what the caller does next:
   6  park: the device is booted and --shutdown was not given: shut it down or pass --shutdown
   7  park would replace the archive of another device: do not add --replace automatically
   8  busy: device lock not free within --wait, another owner's lease, a --busy-lock held, an
-     exclusive ensure/restore on a device that is running, the device still being written
+     exclusive ensure on a device that is running, the device still being written
      120 s after shutdown, or the device was booted or written while being archived
      (nothing deleted). The message names the holder; wait for it, or release it if it is
      stale. If the same holder returns 8 twice, stop and report it
@@ -143,7 +144,7 @@ def now_iso():
 def simctl(*args, device_set=None, timeout=None, keep_lock=False):
     """keep_lock: the child inherits the device lock, so if this process dies it keeps
     others out until it finishes. Only for steps whose half-done state others must not
-    see (clone); everything else could hang on to the lock without bound."""
+    see (clone, rename, delete); boot/bootstatus/shutdown/list could hold it without bound."""
     cmd = ["xcrun", "simctl"]
     if device_set:
         cmd += ["--set", device_set]
@@ -373,7 +374,8 @@ def archive_info(name, runtimes=None):
         meta = read_meta(meta_path)
         info = {"source": "vault"}
         if meta is not None and not os.path.exists(tar_path):
-            info["error"] = "metadata without a tar"
+            info.update(error="metadata without a tar", udid=meta.get("udid"),
+                        restoredAs=meta.get("restoredAs"))
             meta = None
     except Fail as exc:
         if exc.code != EXIT_NO_VAULT:
@@ -427,7 +429,7 @@ def describe_holder(holder):
     text = (f"pid {holder.get('pid')} ({' '.join(holder.get('argv', []))}) "
             f"in {holder.get('cwd')} since {holder.get('startedAt')}")
     if not pid_alive(holder.get("pid")):
-        text += (" - that process has exited; a tar or simctl clone it started still holds "
+        text += (" - that process has exited; a tar or simctl it started still holds "
                  "the lock and releases it when it finishes")
     return text
 
@@ -676,6 +678,14 @@ def stream_into_tar(path, tar_args):
     return digest.hexdigest(), ok
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def newest_mtime(device_dir, now):
     """Newest mtime of anything under device_dir, ignoring timestamps in the future (a
     file stamped ahead of the clock would otherwise look busy forever)."""
@@ -792,45 +802,55 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace):
         plist = plistlib.load(handle)
 
     partial = tar_path + ".partial"
-    started = time.time()
     log(f"archiving {name} ({udid}) to {tar_path}")
-    digest = hashlib.sha256()
-    size = 0
     proc = None
     try:
-        # --no-xattrs --mac-metadata: plain bsdtar puts each xattr in a pax header and its
-        # own reader rejects headers over about 1 MB ("Special header too large"); a MobileAsset
-        # download left a 3.6 MB com.apple.ResourceFork that way (2026-11). AppleDouble
-        # mac-metadata keeps the xattrs, also with COPYFILE_DISABLE=1. Extraction is unchanged,
-        # so older archives still restore.
-        proc = subprocess.Popen(["tar", "--no-xattrs", "--mac-metadata", "-C", DEFAULT_SET,
-                                 "-cf", "-", udid],
-                                stdout=subprocess.PIPE, pass_fds=tuple(HELD_FDS))
-        with open(partial, "wb") as out:
-            for chunk in iter(lambda: proc.stdout.read(CHUNK), b""):
-                digest.update(chunk)
-                out.write(chunk)
-                size += len(chunk)
-            out.flush()
-            os.fsync(out.fileno())
-        if proc.wait() != 0:
-            raise Fail("tar failed while archiving; the simulator was kept")
-        written = digest.hexdigest()
-        # One read-back pass checks both the bytes and that tar can walk the archive:
-        # a matching checksum alone passed a broken archive in testing.
-        read_back, readable = stream_into_tar(partial, ["-t"])
-        if os.path.getsize(partial) != size or read_back != written or not readable:
-            raise Fail("archive read back from the vault is not intact; "
-                       "the simulator was kept")
-        # Someone may have booted the device while tar was reading it; the archive would
-        # then be torn. Check before it replaces the previous one.
-        state = device_state(udid)
-        latest, path = newest_mtime(device_dir, time.time())
-        if state != "Shutdown" or latest >= started:
-            raise Fail(f"'{name}' changed while it was being archived (now {state}; "
-                       f"latest write {path}, {latest - started:+.1f}s after archiving "
-                       "started); the old archive and the device were kept",
-                       EXIT_BUSY, "busy", "let whoever uses it finish, then park again")
+        for attempt in (1, 2):
+            started = time.time()
+            digest = hashlib.sha256()
+            size = 0
+            # --no-xattrs --mac-metadata: plain bsdtar puts each xattr in a pax header and its
+            # own reader rejects headers over about 1 MB ("Special header too large"); a MobileAsset
+            # download left a 3.6 MB com.apple.ResourceFork that way (2026-11). AppleDouble
+            # mac-metadata keeps the xattrs, also with COPYFILE_DISABLE=1. Extraction is unchanged,
+            # so older archives still restore.
+            proc = subprocess.Popen(["tar", "--no-xattrs", "--mac-metadata", "-C", DEFAULT_SET,
+                                     "-cf", "-", udid],
+                                    stdout=subprocess.PIPE, pass_fds=tuple(HELD_FDS))
+            with open(partial, "wb") as out:
+                for chunk in iter(lambda: proc.stdout.read(CHUNK), b""):
+                    digest.update(chunk)
+                    out.write(chunk)
+                    size += len(chunk)
+                out.flush()
+                os.fsync(out.fileno())
+            if proc.wait() != 0:
+                raise Fail("tar failed while archiving; the simulator was kept")
+            written = digest.hexdigest()
+            # One read-back pass checks both the bytes and that tar can walk the archive:
+            # a matching checksum alone passed a broken archive in testing.
+            read_back, readable = stream_into_tar(partial, ["-t"])
+            if os.path.getsize(partial) != size or read_back != written or not readable:
+                raise Fail("archive read back from the vault is not intact; "
+                           "the simulator was kept")
+            # Someone may have booted the device while tar was reading it; the archive would
+            # then be torn. Check before it replaces the previous one.
+            state = device_state(udid)
+            latest, path = newest_mtime(device_dir, time.time())
+            if state == "Shutdown" and latest >= started and attempt == 1:
+                # Shut down a moment ago and only written meanwhile (2026-11: IconsCache, Biome
+                # files of a device whose processes were gone): flush, wait, archive once more.
+                log(f"written while archiving ({path}); waiting and archiving once more")
+                os.remove(partial)
+                os.sync()
+                wait_until_quiet(device_dir)
+                continue
+            if state != "Shutdown" or latest >= started:
+                raise Fail(f"'{name}' changed while it was being archived (now {state}; "
+                           f"latest write {path}, {latest - started:+.1f}s after archiving "
+                           "started); the old archive and the device were kept",
+                           EXIT_BUSY, "busy", "let whoever uses it finish, then park again")
+            break
         meta = {
             "name": name,
             "udid": udid,
@@ -854,12 +874,21 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace):
         # Judge from the files, not a flag: a signal can land right after the tar replace
         # returns, before any flag is set. The metadata .partial exists only once the tar
         # is verified, and the tar .partial is gone only once it was renamed into place.
+        keep = []
         if os.path.exists(meta_path + ".partial") and not os.path.exists(partial):
             # The new tar is in place: its metadata must follow, or the pair is broken
-            # (new tar, old checksum) and no longer restores.
-            cleanup("pair the new metadata with the new tar",
-                    lambda: os.replace(meta_path + ".partial", meta_path))
+            # (new tar, old checksum) and no longer restores. Only if they really match;
+            # otherwise keep the .partial for a human to judge.
+            def pair():
+                with open(meta_path + ".partial") as handle:
+                    if json.load(handle).get("sha256") != file_sha256(tar_path):
+                        raise Fail("new tar does not match the new metadata")
+                os.replace(meta_path + ".partial", meta_path)
+            cleanup("pair the new metadata with the new tar", pair)
+            keep = [meta_path + ".partial"]
         for leftover in (partial, meta_path + ".partial"):
+            if leftover in keep:
+                continue
             if os.path.exists(leftover):
                 cleanup(f"remove {leftover}", lambda p=leftover: os.remove(p))
         raise
@@ -869,7 +898,7 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace):
         raise Fail(f"'{name}' was archived but is now {state}; the device was not deleted",
                    EXIT_BUSY, "busy", "the new archive is good; park again once it is "
                                       "no longer in use")
-    simctl("delete", udid)
+    simctl("delete", udid, keep_lock=True)
     log(f"parked {name}: {size / 1e9:.2f} GB in {time.time() - started:.0f}s; device deleted")
     return {"action": "parked", "udid": udid, "bytes": size, "posterMB": poster // 1024}
 
@@ -885,7 +914,7 @@ def remove_stale_restoring(name, devices=None):
     for device in devices if devices is not None else all_devices():
         if device["name"].startswith(prefix):
             log(f"deleting {device['name']} ({device['udid']}) left by an interrupted restore")
-            simctl("delete", device["udid"])
+            simctl("delete", device["udid"], keep_lock=True)
 
 
 def not_archived_fail(name, existing, info):
@@ -914,7 +943,9 @@ def restore_locked(name, warnings=None):
         log(f"{name} already exists, nothing to restore")
         return {"action": "existing", "udid": existing["udid"], "state": existing["state"],
                 "matchesArchive": matches, "archive": info,
-                "needsReplaceOnFirstPark": matches is False}
+                "needsReplaceOnFirstPark": matches is False or (
+                    meta is None and info.get("udid") is not None
+                    and existing["udid"] not in (info.get("udid"), info.get("restoredAs")))}
     vault = vault_dir()
     tar_path, meta_path = archive_paths(vault, name)
     meta = read_meta(meta_path)
@@ -963,7 +994,7 @@ def restore_locked(name, warnings=None):
                 if entry.endswith(".csstore") and "LaunchServices-" in entry:
                     os.remove(os.path.join(lsd, entry))
         try:
-            simctl("delete", meta["udid"], device_set=staging)
+            simctl("delete", meta["udid"], device_set=staging, keep_lock=True)
         except Fail as exc:
             log(f"warning: could not unregister staging copy: {exc}")
         # Without restoredAs the restored device looks foreign to its own archive (park 7,
@@ -976,11 +1007,12 @@ def restore_locked(name, warnings=None):
             raise Fail(f"could not record the restored UDID in {meta_path}: {exc}; "
                        "the half-restored device was deleted", kind="vault-write",
                        next_step="check the vault is writable, then rerun")
-        simctl("rename", udid, name)
+        simctl("rename", udid, name, keep_lock=True)
         renamed = True
     except BaseException:
         if udid and not renamed:
-            cleanup(f"delete the half-restored {temp_name}", lambda: simctl("delete", udid))
+            cleanup(f"delete the half-restored {temp_name}",
+                    lambda: simctl("delete", udid, keep_lock=True))
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -999,10 +1031,6 @@ def restore(name, wait=DEFAULT_WAIT):
     warnings = []
     with DeviceLock(name, wait):
         result = restore_locked(name, warnings)
-        drop_stale_leases(name, {d["udid"] for d in all_devices()})
-        blocking = blocking_leases(name)
-        if blocking:
-            raise leased_fail(name, blocking)
     result["warnings"] = warnings
     return result
 
@@ -1067,8 +1095,8 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
                         write_json(boot_record_path(name), {"udid": udid, "by": [lease],
                                                             "at": now_iso()})
                     log(f"booting {name}")
-                    booted_by_us = True
                     simctl("boot", udid, timeout=STATE_TIMEOUT)
+                    booted_by_us = True
                 # Booting devices too: return only once it is usable.
                 simctl("bootstatus", udid, "-b", timeout=BOOT_TIMEOUT)
         except BaseException:
@@ -1248,7 +1276,7 @@ def gc(dry_run=False, leases_older_than=86400, prefix=None):
             for device in all_devices():
                 if device["name"].startswith(name + RESTORING):
                     act("restoring-device", f"{device['name']} ({device['udid']})",
-                        lambda u=device["udid"]: simctl("delete", u))
+                        lambda u=device["udid"]: simctl("delete", u, keep_lock=True))
             for owner_name, path in staging_sets():
                 if owner_name == name:
                     act("staging", path, lambda p=path: shutil.rmtree(p, ignore_errors=True))
@@ -1368,7 +1396,8 @@ def build_parser():
                    help="with --lease: refuse (8) if another owner holds a lease or the "
                         "device runs without one, and make later ensures by others refuse")
     wait_flag(p)
-    p = add("restore", "bring <name> back from the vault; never creates or boots; "
+    p = add("restore", "bring <name> back from the vault; never creates or boots and ignores "
+                       "leases (for people and old scripts; lease users call ensure); "
                        "prints the UDID")
     p.add_argument("name")
     wait_flag(p)
@@ -1410,6 +1439,7 @@ def main():
     as_json = "--json" in sys.argv[1:]
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGHUP, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
     try:
         args = build_parser().parse_args()
         if getattr(args, "exclusive", False) and not args.lease:
