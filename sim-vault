@@ -719,6 +719,10 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace):
     elif state != "Shutdown":
         raise Fail(f"'{name}' is {state}", next_step="wait until it is Shutdown, then rerun")
     device_dir = os.path.join(DEFAULT_SET, udid)
+    # Files the device's processes had mapped keep dirty pages after they exit; the kernel
+    # writes them back later, stamping a fresh mtime mid-archive (park then returned 8 on
+    # about half of the parks right after a shutdown, 2026-11 test). Flush them first.
+    os.sync()
     wait_until_quiet(device_dir)
     with open(os.path.join(device_dir, "device.plist"), "rb") as handle:
         plist = plistlib.load(handle)
