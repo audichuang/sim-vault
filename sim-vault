@@ -9,7 +9,8 @@ Project scripts should call `ensure` to get a device and `park` to put it away, 
 exit code on. They should not branch on 3/4/5 themselves: `ensure --create` already does that.
 
 commands (see `sim-vault <command> --help` for flags):
-  status <name>    what is local, what is archived, who uses it; no lock, always 0
+  status <name>    what is local, what is archived, who uses it; waits for no lock
+                   (probes the device lock for an instant); 0 unless simctl fails
   ensure <name>    use the local device, else restore it, else (3/4 with --create) create it;
                    optionally --boot and register a --lease; prints the UDID
   restore <name>   `ensure` without policy: never creates or boots; prints the UDID
@@ -39,9 +40,10 @@ exit codes and what the caller does next:
   6  park: the device is booted and --shutdown was not given: shut it down or pass --shutdown
   7  park would replace the archive of another device: do not add --replace automatically
   8  busy: device lock not free within --wait, another owner's lease, a --busy-lock held, an
-     exclusive ensure on a device that is running, or the device was booted while being
-     archived (nothing deleted). The message names the holder; wait for it, or release it
-     if it is stale. If the same holder returns 8 twice, stop and report it
+     exclusive ensure/restore on a device that is running, the device still being written
+     120 s after shutdown, or the device was booted or written while being archived
+     (nothing deleted). The message names the holder; wait for it, or release it if it is
+     stale. If the same holder returns 8 twice, stop and report it
   9  park: PosterBoard data is over 1 GiB; rebuild it (modern-ios-guidance, PosterBoard) and
      park again; nothing was touched
   10 restore/ensure: the local device with this name is not the archived one, and the
@@ -1348,7 +1350,8 @@ def build_parser():
         p.add_argument("--wait", type=float, default=DEFAULT_WAIT,
                        help="seconds to wait for the device lock (default 60), then exit 8")
 
-    p = add("status", "what is local, archived and leased for <name>; takes no lock; exit 0")
+    p = add("status", "what is local, archived and leased for <name>; never waits for the "
+                      "device lock (probes it for an instant); 0 unless simctl fails")
     p.add_argument("name")
     p = add("ensure", "make <name> available: local device, else restore, else create "
                       "(with --create on 3/4); prints the UDID")
