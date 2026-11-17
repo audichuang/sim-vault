@@ -6,9 +6,10 @@ restored simulator is ready to use. Only the device is archived; the iOS runtime
 and must still be installed when restoring.
 
 usage:
-  sim-vault park <name> [--shutdown] [--replace]
+  sim-vault park <name> [--shutdown] [--replace] [--wait SEC]
                                        archive the device, verify it, then delete it
-  sim-vault restore <name>             bring it back into the default device set, print its UDID
+  sim-vault restore <name> [--wait SEC]
+                                       bring it back into the default device set, print its UDID
   sim-vault list                       show archives in the vault
 
 The vault is $SIM_VAULT_DIR (default /Volumes/WorkSpace/ios-sim). It must sit on a different
@@ -17,10 +18,13 @@ silently filling the local disk.
 
 exit codes: 0 ok, 1 error, 2 usage, 3 no archive, 4 runtime not installed,
             5 vault unavailable, 6 device is booted (park without --shutdown),
-            7 park would overwrite an archive of a different device (pass --replace to allow)
+            7 park would overwrite an archive of a different device (pass --replace to allow),
+            8 busy: the device lock was not free within --wait, or the device was booted
+              while it was being archived (nothing deleted),
+            10 the local device with this name is not the archived one (restore)
 Only 3 and 4 mean "fall back to the old way" (recreate the device). 5 is usually a share that
 remounts within minutes: wait and retry, or stop. A same-name blank device created after a 5
-and parked later would replace the logged-in archive; 7 guards against that.
+and parked later would replace the logged-in archive; 7 and 10 guard against that.
 After a 4 the archive cannot be restored, so the recreated device's first park needs --replace.
 """
 import argparse
@@ -29,25 +33,56 @@ import hashlib
 import json
 import os
 import plistlib
+import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 
+TOOL_VERSION = "2"
 DEFAULT_VAULT = "/Volumes/WorkSpace/ios-sim"
 SIM_ROOT = os.path.expanduser("~/Library/Developer/CoreSimulator")
 DEFAULT_SET = os.path.join(SIM_ROOT, "Devices")
-STAGING_ROOT = os.path.join(SIM_ROOT, "sim-vault-staging")
+# Fixed paths, not $TMPDIR: two sessions with different TMPDIRs must see the same locks.
+STATE_ROOT = os.path.join(SIM_ROOT, "sim-vault")
+LOCK_DIR = os.path.join(STATE_ROOT, "locks")
+STAGING_ROOT = os.path.join(STATE_ROOT, "staging")
+LEGACY_STAGING_ROOT = os.path.join(SIM_ROOT, "sim-vault-staging")
 CHUNK = 8 * 1024 * 1024
+QUIET_SECONDS = 10
+QUIET_TIMEOUT = 120
+STATE_TIMEOUT = 120
+POLL = 1.0
+DEFAULT_WAIT = 60
+RESTORING = " [sim-vault restoring "
 
-EXIT_ERROR, EXIT_NO_ARCHIVE, EXIT_NO_RUNTIME, EXIT_NO_VAULT, EXIT_BOOTED, EXIT_OVERWRITE = 1, 3, 4, 5, 6, 7
+(EXIT_ERROR, EXIT_USAGE, EXIT_NO_ARCHIVE, EXIT_NO_RUNTIME, EXIT_NO_VAULT, EXIT_BOOTED,
+ EXIT_OVERWRITE, EXIT_BUSY, EXIT_NOT_ARCHIVED) = 1, 2, 3, 4, 5, 6, 7, 8, 10
 
 
 class Fail(Exception):
-    def __init__(self, message, code=EXIT_ERROR):
+    def __init__(self, message, code=EXIT_ERROR, kind="error", next_step=None):
         super().__init__(message)
         self.code = code
+        self.kind = kind
+        self.next_step = next_step
+
+
+class Interrupted(BaseException):
+    """SIGTERM/SIGHUP turned into an exception so `finally` blocks clean up."""
+
+    def __init__(self, signum):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def on_signal(signum, _frame):
+    # Ignore repeats so the cleanup that follows is not cut short.
+    signal.signal(signum, signal.SIG_IGN)
+    raise Interrupted(signum)
 
 
 def log(message):
@@ -65,66 +100,191 @@ def simctl(*args, device_set=None):
     return result.stdout
 
 
-def find_devices(name, device_set=None):
+def all_devices(device_set=None):
     data = json.loads(simctl("list", "devices", "-j", device_set=device_set))
-    return [d for devices in data["devices"].values() for d in devices if d["name"] == name]
+    out = []
+    for runtime, devices in data["devices"].items():
+        for device in devices:
+            out.append(dict(device, runtime=runtime))
+    return out
+
+
+def resolve(name):
+    """Available devices with this exact name, and how many unavailable ones share it."""
+    matches = [d for d in all_devices() if d["name"] == name]
+    available = [d for d in matches if d.get("isAvailable", True)]
+    return available, len(matches) - len(available)
 
 
 def find_one(name):
-    matches = find_devices(name)
+    matches, unavailable = resolve(name)
+    if unavailable:
+        log(f"warning: {unavailable} unavailable simulator(s) named '{name}' ignored")
     if len(matches) > 1:
-        raise Fail(f"{len(matches)} simulators are named '{name}'; names must be unique")
+        listing = ", ".join(f"{d['udid']} ({d['state']})" for d in matches)
+        raise Fail(f"{len(matches)} simulators are named '{name}': {listing}",
+                   next_step="names must be unique; delete the extra one after checking "
+                             "it holds nothing you need, then rerun")
     return matches[0] if matches else None
 
 
-def runtime_available(identifier):
-    data = json.loads(simctl("list", "runtimes", "-j"))
-    return any(r["identifier"] == identifier and r.get("isAvailable") for r in data["runtimes"])
+def device_state(udid):
+    for device in all_devices():
+        if device["udid"] == udid:
+            return device["state"]
+    return None
+
+
+def wait_for_shutdown(udid, timeout=STATE_TIMEOUT):
+    deadline = time.time() + timeout
+    while True:
+        state = device_state(udid)
+        if state in ("Shutdown", None):
+            return state
+        if time.time() >= deadline:
+            raise Fail(f"{udid} is still {state} after {timeout}s",
+                       next_step="check `xcrun simctl list devices`, then rerun")
+        time.sleep(POLL)
+
+
+def runtime_available(identifier, runtimes=None):
+    if runtimes is None:
+        runtimes = json.loads(simctl("list", "runtimes", "-j"))["runtimes"]
+    return any(r["identifier"] == identifier and r.get("isAvailable") for r in runtimes)
+
+
+def same_volume(a, b):
+    return os.stat(a).st_dev == os.stat(b).st_dev
 
 
 def vault_dir():
     path = os.path.abspath(os.environ.get("SIM_VAULT_DIR") or DEFAULT_VAULT)
     parent = os.path.dirname(path)
+    retry = "wait for the share to mount again and rerun; do not create a same-name device"
     if not os.path.isdir(parent):
-        raise Fail(f"vault parent {parent} does not exist (share not mounted?)", EXIT_NO_VAULT)
+        raise Fail(f"vault parent {parent} does not exist (share not mounted?)", EXIT_NO_VAULT,
+                   "vault-unavailable", retry)
     try:
-        same_volume = os.stat(parent).st_dev == os.stat(SIM_ROOT).st_dev
+        same = same_volume(parent, SIM_ROOT)
     except OSError as exc:
-        raise Fail(f"cannot stat vault: {exc}", EXIT_NO_VAULT)
-    if same_volume:
+        raise Fail(f"cannot stat vault: {exc}", EXIT_NO_VAULT, "vault-unavailable", retry)
+    if same:
         raise Fail(f"{parent} is on the same volume as CoreSimulator (share not mounted?); "
-                   "parking there would not free any space", EXIT_NO_VAULT)
+                   "parking there would not free any space", EXIT_NO_VAULT,
+                   "vault-unavailable", retry)
     try:
         os.makedirs(path, exist_ok=True)
     except OSError as exc:
-        raise Fail(f"cannot create {path}: {exc}", EXIT_NO_VAULT)
+        raise Fail(f"cannot create {path}: {exc}", EXIT_NO_VAULT, "vault-unavailable", retry)
     if not os.access(path, os.W_OK):
         raise Fail(f"{path} is not writable (launchd jobs may lack network-volume access)",
-                   EXIT_NO_VAULT)
+                   EXIT_NO_VAULT, "vault-unavailable", retry)
     return path
 
 
 def archive_paths(vault, name):
-    if "/" in name or name.startswith("."):
-        raise Fail(f"unsupported simulator name for a file name: {name!r}")
+    # Test devices (SVTEST ...) must never touch the real vault.
+    if name.startswith("SVTEST") and os.path.realpath(vault) == os.path.realpath(DEFAULT_VAULT):
+        raise Fail(f"'{name}' is a test device but the vault is the real one ({vault})",
+                   kind="test-guard", next_step="set SIM_VAULT_DIR to a test vault")
+    if "/" in name or name.startswith(".") or RESTORING.strip() in name:
+        raise Fail(f"unsupported simulator name for a file name: {name!r}", kind="bad-name",
+                   next_step="rename the simulator")
     return os.path.join(vault, f"{name}.tar"), os.path.join(vault, f"{name}.json")
 
 
-class NameLock:
-    """Per-name lock so two sessions cannot park and restore the same device at once."""
+def read_meta(meta_path):
+    """The archive's metadata, or None when there is none. Raises Fail when unreadable."""
+    try:
+        with open(meta_path) as handle:
+            meta = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise Fail(f"cannot read {meta_path}: {exc}", kind="bad-metadata",
+                   next_step="fix or remove the metadata file by hand")
+    if not isinstance(meta, dict) or "udid" not in meta:
+        raise Fail(f"{meta_path} is not sim-vault metadata", kind="bad-metadata",
+                   next_step="fix or remove the metadata file by hand")
+    return meta
 
-    def __init__(self, name):
-        safe = "".join(c if c.isalnum() else "_" for c in name)
-        self.path = os.path.join(tempfile.gettempdir(), f"sim-vault-{safe}.lock")
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def lock_path(name):
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:60]
+    digest = hashlib.sha1(name.encode()).hexdigest()[:8]
+    return os.path.join(LOCK_DIR, f"{safe}-{digest}.lock")
+
+
+def read_holder(path):
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def describe_holder(holder):
+    if not holder:
+        return "another process"
+    return (f"pid {holder.get('pid')} ({' '.join(holder.get('argv', []))}) "
+            f"in {holder.get('cwd')} since {holder.get('startedAt')}")
+
+
+class DeviceLock:
+    """Per-name flock. The kernel drops it when the holder dies, so there is nothing to
+    reclaim. The file is never deleted: a waiter holding the old inode would get in
+    alongside a newcomer on the new one."""
+
+    def __init__(self, name, wait=DEFAULT_WAIT):
+        self.name = name
+        self.wait = wait
+        self.path = lock_path(name)
+        self.fd = None
 
     def __enter__(self):
-        self.handle = open(self.path, "w")
-        fcntl.flock(self.handle, fcntl.LOCK_EX)
+        os.makedirs(LOCK_DIR, exist_ok=True)
+        # Not "w": opening with O_TRUNC would wipe the holder's details for everyone.
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        deadline = time.time() + self.wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    holder = read_holder(self.path)
+                    os.close(fd)
+                    raise Fail(f"'{self.name}' is in use by {describe_holder(holder)}; "
+                               f"waited {self.wait}s", EXIT_BUSY, "busy",
+                               "wait for that process to finish, or pass a longer --wait; "
+                               "if the same holder returns 8 twice, stop and report it")
+                time.sleep(0.2)
+        os.ftruncate(fd, 0)
+        os.write(fd, json.dumps({"pid": os.getpid(), "argv": sys.argv, "cwd": os.getcwd(),
+                                 "startedAt": now_iso()}).encode())
+        self.fd = fd
         return self
 
     def __exit__(self, *exc):
-        fcntl.flock(self.handle, fcntl.LOCK_UN)
-        self.handle.close()
+        # Close only, never LOCK_UN: flock belongs to the open file description, which a
+        # child given the fd (tar in park) shares, and LOCK_UN would release it for that
+        # child too. Callers wait for or kill their children before leaving the block;
+        # a child still alive after an abrupt death of this process keeps the lock.
+        os.close(self.fd)
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
 def stream_into_tar(path, tar_args):
@@ -132,46 +292,63 @@ def stream_into_tar(path, tar_args):
     digest = hashlib.sha256()
     proc = subprocess.Popen(["tar", *tar_args, "-f", "-"], stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    tar_open = True
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(CHUNK), b""):
-            digest.update(chunk)
-            if tar_open:
-                try:
-                    proc.stdin.write(chunk)
-                except BrokenPipeError:
-                    # tar quit on a corrupt stream; keep hashing so the checksum stays a
-                    # whole-file check, and let tar's exit code report the failure.
-                    tar_open = False
     try:
-        proc.stdin.close()
-    except BrokenPipeError:
-        pass
-    stderr = proc.stderr.read().decode(errors="replace").strip()
-    ok = proc.wait() == 0
+        tar_open = True
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(CHUNK), b""):
+                digest.update(chunk)
+                if tar_open:
+                    try:
+                        proc.stdin.write(chunk)
+                    except BrokenPipeError:
+                        # tar quit on a corrupt stream; keep hashing so the checksum stays a
+                        # whole-file check, and let tar's exit code report the failure.
+                        tar_open = False
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        stderr = proc.stderr.read().decode(errors="replace").strip()
+        ok = proc.wait() == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
     if not ok:
         log(f"tar: {stderr[-500:]}")
     return digest.hexdigest(), ok
 
 
-def wait_until_quiet(device_dir, seconds=10, timeout=120):
+def newest_mtime(device_dir, now):
+    """Newest mtime of anything under device_dir, ignoring timestamps in the future (a
+    file stamped ahead of the clock would otherwise look busy forever)."""
+    latest, path_of = 0.0, None
+    for root, dirs, files in os.walk(device_dir):
+        for entry in dirs + files:
+            path = os.path.join(root, entry)
+            try:
+                mtime = os.lstat(path).st_mtime
+            except OSError:
+                continue
+            if latest < mtime <= now + 1:
+                latest, path_of = mtime, path
+    return latest, path_of
+
+
+def wait_until_quiet(device_dir):
     """After shutdown the device keeps flushing files for a while; archiving then gave a
     structurally broken tar with exit code 0 (2026-11 test). Wait for mtimes to settle."""
-    def newest():
-        latest = 0.0
-        for root, _dirs, files in os.walk(device_dir):
-            for entry in files:
-                try:
-                    latest = max(latest, os.lstat(os.path.join(root, entry)).st_mtime)
-                except OSError:
-                    pass
-        return latest
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if time.time() - newest() >= seconds:
+    deadline = time.time() + QUIET_TIMEOUT
+    while True:
+        now = time.time()
+        latest, path = newest_mtime(device_dir, now)
+        if now - latest >= QUIET_SECONDS:
             return
-        time.sleep(2)
-    raise Fail(f"{device_dir} is still being written after {timeout}s; not archiving")
+        if now >= deadline:
+            raise Fail(f"{device_dir} is still being written after {QUIET_TIMEOUT}s "
+                       f"(latest: {path}); not archiving", EXIT_BUSY, "busy",
+                       "something is using the device; find it, stop it, then rerun")
+        time.sleep(POLL)
 
 
 def write_json(path, data):
@@ -180,27 +357,45 @@ def write_json(path, data):
     os.replace(path + ".partial", path)
 
 
-def park(name, shutdown, replace=False):
+def overwrite_message(name, old, udid, runtimes):
+    if runtime_available(old.get("runtime"), runtimes):
+        return (f"the archive of '{name}' came from another device ({old.get('udid')}), "
+                f"not {udid}; parking would replace it",
+                "restore that archive instead (delete this device first if it holds nothing "
+                "you need); pass --replace only to drop the archive on purpose")
+    return (f"the archive of '{name}' came from another device ({old.get('udid')}) and its "
+            f"runtime {old.get('runtime')} is gone, so it cannot be restored any more",
+            "after checking nothing in that archive is needed, rerun with --replace")
+
+
+def park(name, shutdown, replace=False, wait=DEFAULT_WAIT):
     vault = vault_dir()
     tar_path, meta_path = archive_paths(vault, name)
-    with NameLock(name):
+    with DeviceLock(name, wait) as lock:
         device = find_one(name)
         if device is None:
-            raise Fail(f"no simulator named '{name}'", EXIT_ERROR)
+            raise Fail(f"no simulator named '{name}'", kind="absent",
+                       next_step="nothing to park; check the name with `xcrun simctl list "
+                                 "devices`")
         udid = device["udid"]
-        if os.path.exists(meta_path) and not replace:
-            with open(meta_path) as handle:
-                old = json.load(handle)
-            if udid not in (old.get("udid"), old.get("restoredAs")):
-                raise Fail(f"the archive of '{name}' came from another device ({old.get('udid')}), "
-                           f"not {udid}; parking would replace it. Restore that archive instead, "
-                           "or pass --replace to drop it", EXIT_OVERWRITE)
-        if device["state"] != "Shutdown":
+        old = read_meta(meta_path)
+        if old is not None and not replace and udid not in (old.get("udid"),
+                                                            old.get("restoredAs")):
+            message, next_step = overwrite_message(name, old, udid, None)
+            raise Fail(message, EXIT_OVERWRITE, "overwrite", next_step)
+        state = device["state"]
+        if state in ("Booted", "Booting"):
             if not shutdown:
-                raise Fail(f"'{name}' is {device['state']}; shut it down first or pass --shutdown",
-                           EXIT_BOOTED)
+                raise Fail(f"'{name}' is {state}", EXIT_BOOTED, "booted",
+                           "shut it down first, or pass --shutdown if the project allows it")
             log(f"shutting down {name}")
             simctl("shutdown", udid)
+            wait_for_shutdown(udid)
+        elif state == "Shutting Down":
+            log(f"{name} is shutting down; waiting")
+            wait_for_shutdown(udid)
+        elif state != "Shutdown":
+            raise Fail(f"'{name}' is {state}", next_step="wait until it is Shutdown, then rerun")
         device_dir = os.path.join(DEFAULT_SET, udid)
         wait_until_quiet(device_dir)
         with open(os.path.join(device_dir, "device.plist"), "rb") as handle:
@@ -211,9 +406,12 @@ def park(name, shutdown, replace=False):
         log(f"archiving {name} ({udid}) to {tar_path}")
         digest = hashlib.sha256()
         size = 0
+        proc = None
         try:
+            # tar inherits the lock: if this process dies mid-archive, nobody else gets in
+            # until tar stops writing.
             proc = subprocess.Popen(["tar", "-C", DEFAULT_SET, "-cf", "-", udid],
-                                    stdout=subprocess.PIPE)
+                                    stdout=subprocess.PIPE, pass_fds=(lock.fd,))
             with open(partial, "wb") as out:
                 for chunk in iter(lambda: proc.stdout.read(CHUNK), b""):
                     digest.update(chunk)
@@ -230,6 +428,14 @@ def park(name, shutdown, replace=False):
             if os.path.getsize(partial) != size or read_back != written or not readable:
                 raise Fail("archive read back from the vault is not intact; "
                            "the simulator was kept")
+            # Someone may have booted the device while tar was reading it; the archive would
+            # then be torn. Check before it replaces the previous one.
+            state = device_state(udid)
+            latest, path = newest_mtime(device_dir, time.time())
+            if state != "Shutdown" or latest >= started:
+                raise Fail(f"'{name}' changed while it was being archived (now {state}; "
+                           f"latest write {path}); the old archive and the device were kept",
+                           EXIT_BUSY, "busy", "let whoever uses it finish, then park again")
             meta = {
                 "name": name,
                 "udid": udid,
@@ -237,7 +443,9 @@ def park(name, shutdown, replace=False):
                 "deviceType": plist.get("deviceType"),
                 "sha256": written,
                 "bytes": size,
-                "parkedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "parkedAt": now_iso(),
+                "host": socket.gethostname(),
+                "toolVersion": TOOL_VERSION,
             }
             with open(meta_path + ".partial", "w") as handle:
                 json.dump(meta, handle, indent=2)
@@ -245,82 +453,175 @@ def park(name, shutdown, replace=False):
             os.replace(partial, tar_path)
             os.replace(meta_path + ".partial", meta_path)
         except BaseException:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait()
             for leftover in (partial, meta_path + ".partial"):
                 if os.path.exists(leftover):
                     os.remove(leftover)
             raise
+        state = device_state(udid)
+        if state != "Shutdown":
+            raise Fail(f"'{name}' was archived but is now {state}; the device was not deleted",
+                       EXIT_BUSY, "busy", "the new archive is good; park again once it is "
+                                          "no longer in use")
         simctl("delete", udid)
         log(f"parked {name}: {size / 1e9:.2f} GB in {time.time() - started:.0f}s; device deleted")
+        return {"action": "parked", "udid": udid, "bytes": size}
 
 
-def restore(name):
-    with NameLock(name):
-        existing = find_one(name)
-        if existing is not None:
-            log(f"{name} already exists, nothing to restore")
-            print(existing["udid"])
-            return
+def remove_stale_restoring(name):
+    """Delete devices left as '<name> [sim-vault restoring <pid>]' by a dead restore."""
+    prefix = name + RESTORING
+    for device in all_devices():
+        if not device["name"].startswith(prefix):
+            continue
+        match = re.match(r"(\d+)\]$", device["name"][len(prefix):])
+        if match and not pid_alive(int(match.group(1))):
+            log(f"deleting {device['name']} ({device['udid']}) left by an interrupted restore")
+            simctl("delete", device["udid"])
+
+
+def compare_with_archive(udid, name):
+    """(matches, archive info) for a local device. matches is None when there is nothing
+    to compare against (no archive, vault unavailable, unreadable metadata)."""
+    try:
         vault = vault_dir()
         tar_path, meta_path = archive_paths(vault, name)
-        if not (os.path.exists(tar_path) and os.path.exists(meta_path)):
-            raise Fail(f"no archive for '{name}' in {vault}", EXIT_NO_ARCHIVE)
-        with open(meta_path) as handle:
-            meta = json.load(handle)
-        if not runtime_available(meta["runtime"]):
-            raise Fail(f"runtime {meta['runtime']} is not installed; recreate the device instead",
-                       EXIT_NO_RUNTIME)
+        meta = read_meta(meta_path)
+    except Fail as exc:
+        log(f"warning: cannot compare with the archive: {exc}")
+        return None, {"vaultError": str(exc)}
+    if meta is None or not os.path.exists(tar_path):
+        return None, {"exists": False}
+    info = {"exists": True, "udid": meta.get("udid"), "restoredAs": meta.get("restoredAs"),
+            "runtime": meta.get("runtime"), "runtimeAvailable": runtime_available(
+                meta.get("runtime")), "parkedAt": meta.get("parkedAt"),
+            "bytes": meta.get("bytes"), "host": meta.get("host")}
+    return udid in (meta.get("udid"), meta.get("restoredAs")), info
 
-        started = time.time()
-        os.makedirs(STAGING_ROOT, exist_ok=True)
-        # Staging must be on the CoreSimulator volume so clone is a cheap APFS clone.
-        staging = tempfile.mkdtemp(prefix="set-", dir=STAGING_ROOT)
+
+def restore_locked(name):
+    """Restore without taking the lock (the caller holds it). Returns a result dict."""
+    remove_stale_restoring(name)
+    existing = find_one(name)
+    if existing is not None:
+        matches, archive = compare_with_archive(existing["udid"], name)
+        if matches is False and archive.get("runtimeAvailable"):
+            raise Fail(f"'{name}' exists locally ({existing['udid']}) but is not the archived "
+                       f"device ({archive.get('udid')}), which can still be restored",
+                       EXIT_NOT_ARCHIVED, "not-archived-device",
+                       "stop and report this; do not delete or park anything on your own. "
+                       "Once the owner decides: to use the archive and keep the local device, "
+                       f"`xcrun simctl rename {existing['udid']} '<other name>'` and rerun; to "
+                       "use the archive and drop the local device, `xcrun simctl delete "
+                       f"{existing['udid']}` and rerun; to keep the local device and drop the "
+                       f"archive, `sim-vault park '{name}' --replace`")
+        log(f"{name} already exists, nothing to restore")
+        return {"action": "existing", "udid": existing["udid"], "state": existing["state"],
+                "matchesArchive": matches, "archive": archive}
+    vault = vault_dir()
+    tar_path, meta_path = archive_paths(vault, name)
+    meta = read_meta(meta_path)
+    if meta is None or not os.path.exists(tar_path):
+        raise Fail(f"no archive for '{name}' in {vault}", EXIT_NO_ARCHIVE, "no-archive",
+                   "create the device if the project's policy allows it, or ask")
+    if not runtime_available(meta.get("runtime")):
+        raise Fail(f"runtime {meta.get('runtime')} is not installed", EXIT_NO_RUNTIME,
+                   "runtime-missing", "create the device if the project's policy allows it; "
+                                      "its first park then needs --replace")
+    host = socket.gethostname()
+    if meta.get("host") and meta["host"] != host:
+        log(f"warning: this archive was parked on {meta['host']}, not {host}")
+
+    started = time.time()
+    os.makedirs(STAGING_ROOT, exist_ok=True)
+    # Staging must be on the CoreSimulator volume so clone is a cheap APFS clone.
+    staging = tempfile.mkdtemp(prefix="set-", dir=STAGING_ROOT)
+    with open(os.path.join(staging, "owner.json"), "w") as handle:
+        json.dump({"pid": os.getpid(), "name": name}, handle)
+    temp_name = f"{name}{RESTORING}{os.getpid()}]"
+    udid = None
+    renamed = False
+    try:
+        log(f"extracting {tar_path}")
+        digest, extracted = stream_into_tar(tar_path, ["-C", staging, "-x"])
+        if not extracted:
+            raise Fail("tar failed while extracting")
+        if digest != meta.get("sha256"):
+            raise Fail("archive checksum does not match its metadata; not restored")
+        # CoreSimulatorService only scans the default set at startup, so a directory
+        # copied into it stays invisible. Cloning from a private set goes through the
+        # service and does not disturb other running simulators. The clone gets a
+        # temporary name: the real name appearing means the restore finished.
+        udid = simctl("clone", meta["udid"], temp_name, DEFAULT_SET,
+                      device_set=staging).strip()
+        # The clone gets a new UDID, but the LaunchServices database stores app bundle
+        # paths with the old one, so every user app fails with "Launchd job spawn failed"
+        # (2026-11 test). It is a cache: drop it and the first boot rebuilds it.
+        lsd = os.path.join(DEFAULT_SET, udid, "data", "var", "db", "lsd")
+        if os.path.isdir(lsd):
+            for entry in os.listdir(lsd):
+                if entry.endswith(".csstore") and "LaunchServices-" in entry:
+                    os.remove(os.path.join(lsd, entry))
         try:
-            log(f"extracting {tar_path}")
-            digest, extracted = stream_into_tar(tar_path, ["-C", staging, "-x"])
-            if not extracted:
-                raise Fail("tar failed while extracting")
-            if digest != meta["sha256"]:
-                raise Fail("archive checksum does not match its metadata; not restored")
-            # CoreSimulatorService only scans the default set at startup, so a directory
-            # copied into it stays invisible. Cloning from a private set goes through the
-            # service and does not disturb other running simulators.
-            udid = simctl("clone", meta["udid"], name, DEFAULT_SET, device_set=staging).strip()
-            # The clone gets a new UDID, but the LaunchServices database stores app bundle
-            # paths with the old one, so every user app fails with "Launchd job spawn failed"
-            # (2026-11 test). It is a cache: drop it and the first boot rebuilds it.
-            lsd = os.path.join(DEFAULT_SET, udid, "data", "var", "db", "lsd")
-            if os.path.isdir(lsd):
-                for entry in os.listdir(lsd):
-                    if entry.endswith(".csstore") and "LaunchServices-" in entry:
-                        os.remove(os.path.join(lsd, entry))
-            try:
-                simctl("delete", meta["udid"], device_set=staging)
-            except Fail as exc:
-                log(f"warning: could not unregister staging copy: {exc}")
-        finally:
-            shutil.rmtree(staging, ignore_errors=True)
-        # Record the new UDID so a later park of this device may replace its own archive.
+            simctl("delete", meta["udid"], device_set=staging)
+        except Fail as exc:
+            log(f"warning: could not unregister staging copy: {exc}")
+        # Record the new UDID before the rename, so a finished restore always has it and a
+        # later park of this device may replace its own archive.
+        # Without it the restored device looks foreign to its own archive (park 7,
+        # restore 10), so a failed write aborts the restore.
         meta["restoredAs"] = udid
         try:
             write_json(meta_path, meta)
         except OSError as exc:
-            log(f"warning: could not record the restored UDID ({exc}); park will need --replace")
-        log(f"restored {name} as {udid} in {time.time() - started:.0f}s "
-            f"(archive kept at {tar_path})")
-        print(udid)
+            raise Fail(f"could not record the restored UDID in {meta_path}: {exc}; "
+                       "the half-restored device was deleted", kind="vault-write",
+                       next_step="check the vault is writable, then rerun")
+        simctl("rename", udid, name)
+        renamed = True
+    except BaseException:
+        if udid and not renamed:
+            try:
+                simctl("delete", udid)
+            except BaseException as exc:
+                log(f"warning: could not delete the half-restored {temp_name}: {exc}")
+        raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    log(f"restored {name} as {udid} in {time.time() - started:.0f}s "
+        f"(archive kept at {tar_path})")
+    return {"action": "restored", "udid": udid, "state": "Shutdown", "matchesArchive": True}
+
+
+def restore(name, wait=DEFAULT_WAIT):
+    with DeviceLock(name, wait):
+        return restore_locked(name)
 
 
 def list_archives():
     vault = vault_dir()
+    runtimes = json.loads(simctl("list", "runtimes", "-j"))["runtimes"]
+    archives, errors = [], []
     for entry in sorted(os.listdir(vault)):
-        if not entry.endswith(".json"):
+        # ._* are AppleDouble files the SMB client leaves next to real ones.
+        if not entry.endswith(".json") or entry.startswith("._"):
             continue
-        with open(os.path.join(vault, entry)) as handle:
-            meta = json.load(handle)
-        runtime = meta.get("runtime", "?")
-        status = "ok" if runtime_available(runtime) else "runtime missing"
-        print(f"{meta['name']}\t{meta['bytes'] / 1e9:.2f} GB\t{meta['parkedAt']}\t"
-              f"{runtime.rsplit('.', 1)[-1]}\t{status}")
+        path = os.path.join(vault, entry)
+        try:
+            meta = read_meta(path)
+            runtime = meta.get("runtime") or "?"
+            archives.append(dict(meta, runtimeAvailable=runtime_available(runtime, runtimes)))
+        except Fail as exc:
+            errors.append({"file": entry, "error": str(exc)})
+            log(f"error: {exc}")
+    for meta in archives:
+        runtime = meta.get("runtime") or "?"
+        status = "ok" if meta["runtimeAvailable"] else "runtime missing"
+        print(f"{meta.get('name')}\t{(meta.get('bytes') or 0) / 1e9:.2f} GB\t"
+              f"{meta.get('parkedAt')}\t{runtime.rsplit('.', 1)[-1]}\t{status}")
+    return {"archives": archives, "errors": errors}
 
 
 def main():
@@ -335,18 +636,34 @@ def main():
                         help="replace an archive that came from a different device")
     p_restore = sub.add_parser("restore", help="restore the device and print its UDID")
     p_restore.add_argument("name")
+    for p in (p_park, p_restore):
+        p.add_argument("--wait", type=float, default=DEFAULT_WAIT,
+                       help="seconds to wait for the device lock (default 60); then exit 8")
     sub.add_parser("list", help="list archives in the vault")
     args = parser.parse_args()
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)
     try:
         if args.command == "park":
-            park(args.name, args.shutdown, args.replace)
+            park(args.name, args.shutdown, args.replace, args.wait)
         elif args.command == "restore":
-            restore(args.name)
+            print(restore(args.name, args.wait)["udid"])
         else:
             list_archives()
     except Fail as exc:
         log(f"error: {exc}")
+        if exc.next_step:
+            log(f"next: {exc.next_step}")
         sys.exit(exc.code)
+    except Interrupted as exc:
+        log(f"interrupted by signal {exc.signum}; cleaned up")
+        sys.exit(128 + exc.signum)
+    except KeyboardInterrupt:
+        log("interrupted; cleaned up")
+        sys.exit(130)
+    except Exception as exc:  # no traceback: agents read it as a cue to guess
+        log(f"error: unexpected {type(exc).__name__}: {exc}")
+        sys.exit(EXIT_ERROR)
 
 
 if __name__ == "__main__":
