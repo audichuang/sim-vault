@@ -503,17 +503,19 @@ def try_lock(name):
 
 def hold_busy_locks(templates, udid):
     """Take each project lock file (flock) without waiting and keep it until park is done.
-    Files that do not exist are skipped: nobody can hold them."""
+    A missing file is created (empty, never truncated or written): a project that creates
+    it later to flock it must find it taken. The lock of a freshly restored device (new
+    UDID) never exists yet, so skipping it would leave the whole park unguarded."""
     held = []
     try:
         for template in templates:
             path = template.replace("{udid}", udid)
             try:
-                fd = os.open(path, os.O_RDONLY)   # no create, no truncate
-            except FileNotFoundError:
-                continue
+                fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o644)
             except OSError as exc:
-                raise Fail(f"cannot open --busy-lock {path}: {exc}")
+                raise Fail(f"cannot open or create --busy-lock {path}: {exc}; not parking",
+                           kind="busy-lock-unavailable",
+                           next_step="fix the path (does its directory exist?) and rerun")
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -1151,20 +1153,22 @@ def gc(dry_run=False, leases_older_than=86400, prefix=None):
         if not dry_run:
             fn()
 
-    devices = all_devices()
+    def staging_sets():
+        out = []
+        if os.path.isdir(STAGING_ROOT):
+            for entry in sorted(os.listdir(STAGING_ROOT)):
+                path = os.path.join(STAGING_ROOT, entry)
+                owner = read_holder(os.path.join(path, "owner.json")) or {}
+                out.append((owner.get("name"), path))
+        return out
+
     # Half-restored devices and staging sets: only under the name's lock, so a restore
     # still running (or a child of a killed one still holding the lock) is left alone.
-    by_name = {}
-    for device in devices:
-        if RESTORING in device["name"]:
-            by_name.setdefault(device["name"].split(RESTORING)[0], []).append(device)
-    staging_sets = []
-    if os.path.isdir(STAGING_ROOT):
-        for entry in sorted(os.listdir(STAGING_ROOT)):
-            path = os.path.join(STAGING_ROOT, entry)
-            owner = read_holder(os.path.join(path, "owner.json")) or {}
-            staging_sets.append((owner.get("name"), owner.get("pid"), path))
-    names = set(by_name) | {n for n, _p, _s in staging_sets if n}
+    # The listing before the lock only picks the names; what to delete is listed again
+    # once the lock is held, because a restore may have finished (renamed its temporary
+    # device into the real one) in between.
+    names = {d["name"].split(RESTORING)[0] for d in all_devices() if RESTORING in d["name"]}
+    names |= {n for n, _path in staging_sets() if n}
     for name in sorted(n for n in names if wanted(n)):
         lock = try_lock(name)
         if lock is None:
@@ -1173,15 +1177,17 @@ def gc(dry_run=False, leases_older_than=86400, prefix=None):
         # Holding the lock means no restore of this name is running (its children keep the
         # lock too), so what is left is a leftover whatever the recorded pid says.
         try:
-            for device in by_name.get(name, []):
-                act("restoring-device", f"{device['name']} ({device['udid']})",
-                    lambda u=device["udid"]: simctl("delete", u))
-            for owner_name, pid, path in staging_sets:
+            for device in all_devices():
+                if device["name"].startswith(name + RESTORING):
+                    act("restoring-device", f"{device['name']} ({device['udid']})",
+                        lambda u=device["udid"]: simctl("delete", u))
+            for owner_name, path in staging_sets():
                 if owner_name == name:
                     act("staging", path, lambda p=path: shutil.rmtree(p, ignore_errors=True))
         finally:
             lock.__exit__(None, None, None)
-    for owner_name, _pid, path in staging_sets:
+    devices = all_devices()
+    for owner_name, path in staging_sets():
         if owner_name is None and not prefix:
             attention.append({"kind": "staging", "what": path, "note": "no owner.json"})
     # The old staging path has no pid or owner, and the old sim-vault may be restoring into
