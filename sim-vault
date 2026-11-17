@@ -850,6 +850,10 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace):
                            f"latest write {path}, {latest - started:+.1f}s after archiving "
                            "started); the old archive and the device were kept",
                            EXIT_BUSY, "busy", "let whoever uses it finish, then park again")
+            if attempt == 2 and [d["udid"] for d in resolve(name)[0]] != [udid]:
+                raise Fail(f"'{name}' no longer names only {udid} after archiving again; the "
+                           "old archive and the local devices were kept", EXIT_BUSY, "busy",
+                           "check `xcrun simctl list devices`, then park again")
             break
         meta = {
             "name": name,
@@ -1082,7 +1086,7 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
             os.makedirs(lease_dir(name), exist_ok=True)
             # The lease goes in before booting, so a device we boot always has an owner.
             write_json(lease_file, record)
-        booted_by_us = False
+        booted_by_us = wrote_record = False
         try:
             if boot:
                 state = device_state(udid)
@@ -1094,6 +1098,7 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
                         # shutdown duty on record (reconciled against the real state later).
                         write_json(boot_record_path(name), {"udid": udid, "by": [lease],
                                                             "at": now_iso()})
+                        wrote_record = True
                     log(f"booting {name}")
                     simctl("boot", udid, timeout=STATE_TIMEOUT)
                     booted_by_us = True
@@ -1101,6 +1106,9 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
                 simctl("bootstatus", udid, "-b", timeout=BOOT_TIMEOUT)
         except BaseException:
             keep_lease = False
+            if wrote_record and not booted_by_us:
+                # simctl boot itself failed: nothing of ours is running, drop the record.
+                remove_file(boot_record_path(name))
             if booted_by_us:
                 # Undo our own boot so a retry by the same owner does not find a running
                 # device without a lease (8). If that fails too, keep lease and record so
