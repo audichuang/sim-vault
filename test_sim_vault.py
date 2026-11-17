@@ -1294,7 +1294,11 @@ class T3Review(SimVaultCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         r = self.sv("restore", "SVTEST a")
         self.assertEqual(r.returncode, 0, r.stderr)
-        g = os.path.join(self.devset, r.stdout.strip(), "data", "fork").encode()
+        # The fake clone (copytree) drops xattrs; check the archive itself keeps it.
+        out = self.mkdir("extract")
+        subprocess.run(["/usr/bin/tar", "-xf", os.path.join(self.vault, "SVTEST a.tar"), "-C",
+                        out], check=True)
+        g = os.path.join(out, udid, "data", "fork").encode()
         self.assertEqual(libc.getxattr(g, b"com.apple.ResourceFork", None, 0, 0, 0), len(val))
 
     def test_r11_plain_tar_archive_still_restores(self):

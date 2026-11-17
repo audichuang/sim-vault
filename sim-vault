@@ -112,9 +112,22 @@ class Interrupted(BaseException):
 
 
 def on_signal(signum, _frame):
-    # Ignore repeats so the cleanup that follows is not cut short.
-    signal.signal(signum, signal.SIG_IGN)
+    # Ignore every further signal so the cleanup that follows is not cut short.
+    for other in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(other, signal.SIG_IGN)
     raise Interrupted(signum)
+
+
+# Cleanup steps that failed; the final message then points at gc instead of "cleaned up".
+CLEANUP_FAILURES = []
+
+
+def cleanup(what, fn):
+    try:
+        fn()
+    except BaseException as exc:
+        CLEANUP_FAILURES.append(f"{what}: {exc}")
+        log(f"warning: could not {what}: {exc}")
 
 
 def log(message):
@@ -125,18 +138,17 @@ def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
-def run(cmd, timeout=None, **kwargs):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                          pass_fds=tuple(HELD_FDS), **kwargs)
-
-
-def simctl(*args, device_set=None, timeout=None):
+def simctl(*args, device_set=None, timeout=None, keep_lock=False):
+    """keep_lock: the child inherits the device lock, so if this process dies it keeps
+    others out until it finishes. Only for steps whose half-done state others must not
+    see (clone); everything else could hang on to the lock without bound."""
     cmd = ["xcrun", "simctl"]
     if device_set:
         cmd += ["--set", device_set]
     cmd += list(args)
     try:
-        result = run(cmd, timeout=timeout)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                                pass_fds=tuple(HELD_FDS) if keep_lock else ())
     except subprocess.TimeoutExpired:
         raise Fail(f"{' '.join(cmd)} did not finish in {timeout}s",
                    next_step="check the device in `xcrun simctl list devices`, then rerun")
@@ -397,11 +409,25 @@ def read_holder(path):
         return None
 
 
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, TypeError):
+        return True
+    return True
+
+
 def describe_holder(holder):
     if not holder:
         return "another process"
-    return (f"pid {holder.get('pid')} ({' '.join(holder.get('argv', []))}) "
+    text = (f"pid {holder.get('pid')} ({' '.join(holder.get('argv', []))}) "
             f"in {holder.get('cwd')} since {holder.get('startedAt')}")
+    if not pid_alive(holder.get("pid")):
+        text += (" - that process has exited; a tar or simctl clone it started still holds "
+                 "the lock and releases it when it finishes")
+    return text
 
 
 def lock_holder(name):
@@ -734,7 +760,13 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace):
     size = 0
     proc = None
     try:
-        proc = subprocess.Popen(["tar", "-C", DEFAULT_SET, "-cf", "-", udid],
+        # --no-xattrs --mac-metadata: plain bsdtar puts each xattr in a pax header and its
+        # own reader rejects headers over about 1 MB ("Special header too large"); a MobileAsset
+        # download left a 3.6 MB com.apple.ResourceFork that way (2026-11). AppleDouble
+        # mac-metadata keeps the xattrs, also with COPYFILE_DISABLE=1. Extraction is unchanged,
+        # so older archives still restore.
+        proc = subprocess.Popen(["tar", "--no-xattrs", "--mac-metadata", "-C", DEFAULT_SET,
+                                 "-cf", "-", udid],
                                 stdout=subprocess.PIPE, pass_fds=tuple(HELD_FDS))
         with open(partial, "wb") as out:
             for chunk in iter(lambda: proc.stdout.read(CHUNK), b""):
@@ -781,9 +813,17 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace):
         if proc is not None and proc.poll() is None:
             proc.kill()
             proc.wait()
+        # Judge from the files, not a flag: a signal can land right after the tar replace
+        # returns, before any flag is set. The metadata .partial exists only once the tar
+        # is verified, and the tar .partial is gone only once it was renamed into place.
+        if os.path.exists(meta_path + ".partial") and not os.path.exists(partial):
+            # The new tar is in place: its metadata must follow, or the pair is broken
+            # (new tar, old checksum) and no longer restores.
+            cleanup("pair the new metadata with the new tar",
+                    lambda: os.replace(meta_path + ".partial", meta_path))
         for leftover in (partial, meta_path + ".partial"):
             if os.path.exists(leftover):
-                os.remove(leftover)
+                cleanup(f"remove {leftover}", lambda p=leftover: os.remove(p))
         raise
     save_record(name, meta)
     state = device_state(udid)
@@ -875,7 +915,7 @@ def restore_locked(name, warnings=None):
         # service and does not disturb other running simulators. The clone gets a
         # temporary name: the real name appearing means the restore finished.
         udid = simctl("clone", meta["udid"], temp_name, DEFAULT_SET,
-                      device_set=staging).strip()
+                      device_set=staging, keep_lock=True).strip()
         # The clone gets a new UDID, but the LaunchServices database stores app bundle
         # paths with the old one, so every user app fails with "Launchd job spawn failed"
         # (2026-11 test). It is a cache: drop it and the first boot rebuilds it.
@@ -902,10 +942,7 @@ def restore_locked(name, warnings=None):
         renamed = True
     except BaseException:
         if udid and not renamed:
-            try:
-                simctl("delete", udid)
-            except BaseException as exc:
-                log(f"warning: could not delete the half-restored {temp_name}: {exc}")
+            cleanup(f"delete the half-restored {temp_name}", lambda: simctl("delete", udid))
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -1069,8 +1106,12 @@ def list_archives():
         try:
             meta = read_meta(path)
             runtime = meta.get("runtime") or "?"
+            tar = path[:-5] + ".tar"
+            has_tar = os.path.exists(tar)
             archives.append(dict(meta, runtimeAvailable=runtime_available(runtime, runtimes),
-                                 hasTar=os.path.exists(path[:-5] + ".tar")))
+                                 hasTar=has_tar,
+                                 sizeMatches=has_tar and os.path.getsize(tar) == meta.get(
+                                     "bytes")))
             names.add(entry[:-5])
         except Fail as exc:
             errors.append({"file": entry, "error": str(exc)})
@@ -1084,6 +1125,10 @@ def print_list(result):
     for meta in result["archives"]:
         runtime = meta.get("runtime") or "?"
         status_text = "ok" if meta["runtimeAvailable"] else "runtime missing"
+        if not meta["hasTar"]:
+            status_text += ", tar missing"
+        elif not meta["sizeMatches"]:
+            status_text += ", tar/json size mismatch"
         print(f"{meta.get('name')}\t{(meta.get('bytes') or 0) / 1e9:.2f} GB\t"
               f"{meta.get('parkedAt')}\t{runtime.rsplit('.', 1)[-1]}\t{status_text}")
 
@@ -1328,12 +1373,17 @@ def main():
                        "next": exc.next_step})
         sys.exit(exc.code)
     except Interrupted as exc:
-        log(f"interrupted by signal {exc.signum}; cleaned up")
+        if CLEANUP_FAILURES:
+            log(f"interrupted by signal {exc.signum}; cleanup incomplete, run "
+                "`sim-vault gc --dry-run` to see what is left")
+        else:
+            log(f"interrupted by signal {exc.signum}; cleaned up")
         emit(as_json, {"ok": False, "code": 128 + exc.signum, "kind": "interrupted",
                        "message": f"signal {exc.signum}", "next": "rerun"})
         sys.exit(128 + exc.signum)
     except KeyboardInterrupt:
-        log("interrupted; cleaned up")
+        log("interrupted; cleaned up" if not CLEANUP_FAILURES else
+            "interrupted; cleanup incomplete, run `sim-vault gc --dry-run`")
         emit(as_json, {"ok": False, "code": 130, "kind": "interrupted",
                        "message": "SIGINT", "next": "rerun"})
         sys.exit(130)
