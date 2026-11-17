@@ -20,7 +20,7 @@ import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(HERE, "sim-vault")
+SCRIPT = os.environ.get("SV_TEST_SCRIPT_UNDER_TEST") or os.path.join(HERE, "sim-vault")
 RT = "com.apple.CoreSimulator.SimRuntime.iOS-27-2"
 RT_OLD = "com.apple.CoreSimulator.SimRuntime.iOS-26-0"
 PY = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
@@ -77,6 +77,17 @@ def set_state(d, state):
         open(marker, "a").write("x")
 
 n = bump(sub)
+held = []
+for fd in range(3, 256):
+    try:
+        path = fcntl.fcntl(fd, 50, b"\0" * 1024).split(b"\0")[0].decode()   # F_GETPATH
+    except OSError:
+        continue
+    if path.endswith(".lock"):
+        held.append(path)
+if held:
+    with open(os.path.join(root, "inherited"), "a") as h:
+        h.write(json.dumps([sub, held]) + "\n")
 hooks = json.load(open(os.path.join(root, "hooks.json"))) if os.path.exists(
     os.path.join(root, "hooks.json")) else []
 for hk in hooks:
@@ -186,12 +197,18 @@ if "-cf" in args:
     if os.environ.get("FAKE_TAR_SLEEP"):
         time.sleep(float(os.environ["FAKE_TAR_SLEEP"]))
     target = os.environ.get("FAKE_TAR_BOOT")
+    mode = os.environ.get("FAKE_TAR_MODE", "both")   # both | state | touch
     if target:
         p = os.path.join(os.environ["HOME"], "Library/Developer/CoreSimulator/Devices", target)
-        d = plistlib.load(open(os.path.join(p, "device.plist"), "rb"))
-        d["fakeState"] = "Booted"
-        plistlib.dump(d, open(os.path.join(p, "device.plist"), "wb"))
-        open(os.path.join(p, "data", "boot-marker"), "a").write("x")
+        if mode in ("both", "state"):
+            d = plistlib.load(open(os.path.join(p, "device.plist"), "rb"))
+            d["fakeState"] = "Booted"
+            plistlib.dump(d, open(os.path.join(p, "device.plist"), "wb"))
+            # keep the plist's mtime old: only the state changes
+            if mode == "state":
+                os.utime(os.path.join(p, "device.plist"), (0, 0))
+        if mode in ("both", "touch"):
+            open(os.path.join(p, "data", "boot-marker"), "a").write("x")
 os.execv("/usr/bin/tar", ["tar"] + args)
 '''
 
@@ -211,6 +228,24 @@ if os.environ.get("SV_TEST_DEFAULT_VAULT"):
 mod.QUIET_SECONDS = 0.3
 mod.QUIET_TIMEOUT = 5
 mod.POLL = 0.05
+if os.environ.get("SV_TEST_KILL_AFTER_TAR_REPLACE"):
+    import signal
+    real_replace = os.replace
+    def replace(src, dst):
+        real_replace(src, dst)
+        if dst.endswith(".tar"):
+            os.kill(os.getpid(), signal.SIGTERM)
+    mod.os.replace = replace
+if os.environ.get("SV_TEST_SLOW_REMOVE") or os.environ.get("SV_TEST_FAIL_REMOVE"):
+    import time
+    real_remove = os.remove
+    def remove(path):
+        if path.endswith(".partial"):
+            if os.environ.get("SV_TEST_FAIL_REMOVE"):
+                raise PermissionError(1, "denied", path)
+            time.sleep(1.5)
+        real_remove(path)
+    mod.os.remove = remove
 sys.argv = ["sim-vault"] + sys.argv[1:]
 mod.main()
 '''
@@ -1030,6 +1065,251 @@ class T2SharedLayer(SimVaultCase):
 
     def wait_for(self, predicate, timeout=20):
         return T1Core.wait_for(self, predicate, timeout)
+
+
+class T3Review(SimVaultCase):
+    """Round-1 review findings (Fable, Codex), one test or more per finding."""
+    js = T2SharedLayer.js
+    leases_dir = T2SharedLayer.leases_dir
+    mkdir = T1Core.mkdir
+    staging = T1Core.staging
+    wait_for = T1Core.wait_for
+
+    def inherited(self):
+        path = os.path.join(self.fake, "inherited")
+        if not os.path.exists(path):
+            return []
+        with open(path) as h:
+            return [json.loads(line)[0] for line in h]
+
+    def boot_record(self, name="SVTEST a"):
+        import glob
+        found = glob.glob(os.path.join(self.leases_dir(), "*", "_boot.json"))
+        return json.load(open(found[0])) if found else None
+
+    # 1 gc must not delete a device that a restore finished renaming meanwhile
+    def test_r1_gc_relists_under_lock(self):
+        self.parked("SVTEST a")
+        self.parked("SVTEST b")
+        self.xcrun("create", "SVTEST a [sim-vault restoring 1]", "iPhone 18 Pro Max", RT)
+        self.hooks([{"cmd": "rename", "n": 1, "action": "sleep", "seconds": 3},
+                    {"cmd": "delete", "n": 2, "action": "sleep", "seconds": 6}])
+        p = self.spawn("restore", "SVTEST b")
+        self.wait_for(lambda: self.count("rename") >= 1)
+        g = self.spawn("gc", "--name-prefix", "SVTEST", "--json")
+        out, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 0, err)
+        g.communicate(timeout=60)
+        self.assertEqual([d["name"] for d in self.devices()], ["SVTEST b"])
+
+    # 2 --busy-lock file that does not exist yet is created and held
+    def test_r2_busy_lock_created_and_held(self):
+        import fcntl
+        udid = self.create("SVTEST a")
+        tmpl = os.path.join(self.base, "hl-{udid}.lock")
+        path = tmpl.replace("{udid}", udid)
+        p = self.spawn("park", "SVTEST a", "--busy-lock", tmpl, FAKE_TAR_SLEEP=3)
+        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        self.assertTrue(os.path.exists(path))
+        with open(path) as h:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(h, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _o, err = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertEqual(os.path.getsize(path), 0)
+
+    def test_r2_busy_lock_uncreatable_refuses(self):
+        self.create("SVTEST a")
+        rc, d = self.js("park", "SVTEST a", "--busy-lock",
+                        os.path.join(self.base, "no-such-dir", "{udid}.lock"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(len(self.devices("SVTEST a")), 1)
+
+    # 3 restore honours another owner's exclusive lease
+    def test_r3_restore_respects_exclusive_lease(self):
+        self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--exclusive", "--lease", "A")[0], 0)
+        r = self.sv("restore", "SVTEST a")
+        self.assertEqual((r.returncode, r.stdout), (8, ""))
+        self.assertEqual(self.js("release", "SVTEST a", "--lease", "A")[0], 0)
+        r = self.sv("restore", "SVTEST a")
+        self.assertEqual(r.returncode, 0)
+        self.assertRegex(r.stdout, r"^[0-9A-F-]{36}\n$")
+
+    # 4a a boot interrupted before its record was written still gets shut down later
+    def test_r4a_boot_intent_written_before_boot(self):
+        udid = self.create("SVTEST a")
+        self.hooks([{"cmd": "boot", "n": 1, "action": "sleep", "seconds": 30}])
+        p = self.spawn("ensure", "SVTEST a", "--boot", "--lease", "A")
+        self.wait_for(lambda: self.count("boot") >= 1)
+        time.sleep(0.3)
+        p.kill()
+        p.wait(timeout=30)
+        p.stdout.close()
+        p.stderr.close()
+        self.assertIsNotNone(self.boot_record())
+        self.hooks([])
+        self.patch_device(udid, fakeState="Booted")      # the orphaned simctl boot went through
+        rc, d = self.js("release", "SVTEST a", "--lease", "A", "--shutdown", "--wait", "40")
+        self.assertEqual((rc, d["shutdown"]), (0, True))
+        self.assertEqual(self.state(udid), "Shutdown")
+
+    # 4b bootstatus failure: what we booted is shut down again, same owner can retry
+    def test_r4b_bootstatus_failure_cleans_up(self):
+        udid = self.create("SVTEST a")
+        rc, _ = self.js("ensure", "SVTEST a", "--exclusive", "--boot", "--lease", "A",
+                        FAKE_BOOTSTATUS_RC=1)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.state(udid), "Shutdown")
+        self.assertIsNone(self.boot_record())
+        rc, d = self.js("ensure", "SVTEST a", "--exclusive", "--boot", "--lease", "A")
+        self.assertEqual((rc, d["bootedByUs"]), (0, True))
+
+    # 4c last lease released without --shutdown drops the record; a Shutdown device too
+    def test_r4c_record_cleared(self):
+        udid = self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--boot", "--lease", "A")[0], 0)
+        self.assertEqual(self.js("release", "SVTEST a", "--lease", "A")[0], 0)
+        self.assertIsNone(self.boot_record())
+        self.assertEqual(self.js("ensure", "SVTEST a", "--boot", "--lease", "B")[0], 0)
+        self.patch_device(udid, fakeState="Shutdown")   # shut down by hand
+        self.assertEqual(self.js("ensure", "SVTEST a", "--lease", "B")[0], 0)
+        self.assertIsNone(self.boot_record())
+
+    # 4d release --shutdown without a lease of one's own does not shut down
+    def test_r4d_release_needs_own_lease(self):
+        udid = self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--boot", "--lease", "A")[0], 0)
+        for f in os.listdir(os.path.join(self.leases_dir(), os.listdir(self.leases_dir())[0])):
+            if not f.startswith("_"):
+                os.remove(os.path.join(self.leases_dir(), os.listdir(self.leases_dir())[0], f))
+        rc, d = self.js("release", "SVTEST a", "--lease", "C", "--shutdown")
+        self.assertEqual((rc, d["shutdown"]), (0, False))
+        self.assertEqual(self.state(udid), "Booted")
+
+    # 5 each half of the re-check is needed on its own
+    def check_torn(self, mode):
+        self.parked("SVTEST a")
+        new = self.sv("restore", "SVTEST a").stdout.strip()
+        sha = self.tar_sha("SVTEST a")
+        r = self.sv("park", "SVTEST a", FAKE_TAR_BOOT=new, FAKE_TAR_MODE=mode)
+        self.assertEqual(r.returncode, 8, r.stderr)
+        self.assertEqual(self.tar_sha("SVTEST a"), sha)
+        self.assertEqual([d["UDID"] for d in self.devices("SVTEST a")], [new])
+
+    def test_r5_written_while_archiving_state_unchanged(self):
+        self.check_torn("touch")
+
+    def test_r5_booted_while_archiving_no_write(self):
+        self.check_torn("state")
+
+    # 6 interrupted between the two replaces: json follows the new tar
+    def test_r6_tar_and_json_stay_paired(self):
+        self.parked("SVTEST a")
+        new = self.sv("restore", "SVTEST a").stdout.strip()
+        r = self.sv("park", "SVTEST a", SV_TEST_KILL_AFTER_TAR_REPLACE=1)
+        self.assertEqual(r.returncode, 143, r.stderr)
+        self.assertEqual(self.meta("SVTEST a")["udid"], new)
+        self.assertEqual(self.meta("SVTEST a")["sha256"], self.tar_sha("SVTEST a"))
+
+    def test_r6_list_flags_size_mismatch(self):
+        self.parked("SVTEST a")
+        with open(os.path.join(self.vault, "SVTEST a.tar"), "ab") as h:
+            h.write(b"\0" * 512)
+        rc, d = self.js("list")
+        self.assertFalse(d["archives"][0]["sizeMatches"])
+        self.assertIn("size mismatch", self.sv("list").stdout)
+
+    # 7 a second signal does not cut the cleanup short; failed cleanup is not "cleaned up"
+    def test_r7_second_signal_ignored_during_cleanup(self):
+        self.create("SVTEST a")
+        p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=30, SV_TEST_SLOW_REMOVE=1)
+        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        p.send_signal(signal.SIGTERM)
+        time.sleep(0.5)
+        p.send_signal(signal.SIGHUP)
+        _o, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 128 + signal.SIGTERM, err)
+        self.assert_no_partials()
+
+    def test_r7_failed_cleanup_is_reported(self):
+        self.create("SVTEST a")
+        p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=30, SV_TEST_FAIL_REMOVE=1)
+        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        p.send_signal(signal.SIGTERM)
+        _o, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 128 + signal.SIGTERM, err)
+        self.assertNotIn("cleaned up", err)
+        self.assertIn("gc", err)
+
+    # 8 only tar and clone inherit the lock; a dead holder is named as such
+    def test_r8_only_protected_children_inherit_lock(self):
+        self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--boot", "--lease", "A")[0], 0)
+        self.assertEqual(self.js("release", "SVTEST a", "--lease", "A", "--shutdown")[0], 0)
+        self.assertEqual(self.js("park", "SVTEST a")[0], 0)
+        self.assertEqual(self.js("restore", "SVTEST a")[0], 0)
+        self.assertEqual(sorted(set(self.inherited())), ["clone"])
+
+    def test_r8_dead_holder_message(self):
+        self.create("SVTEST a")
+        p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=4)
+        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        p.kill()
+        p.wait(timeout=30)
+        p.stdout.close()
+        p.stderr.close()
+        r = self.sv("restore", "SVTEST a", "--wait", "1")
+        self.assertEqual(r.returncode, 8, r.stderr)
+        self.assertIn("has exited", r.stderr)
+        time.sleep(4)
+
+    # 9 metadata without a tar
+    def test_r9_json_without_tar(self):
+        self.parked("SVTEST a")
+        os.remove(os.path.join(self.vault, "SVTEST a.tar"))
+        rc, d = self.js("ensure", "SVTEST a", "--create", "iPhone 18 Pro Max")
+        self.assertEqual((rc, d["action"], d["needsReplaceOnFirstPark"]), (0, "created", True))
+        r = self.sv("park", "SVTEST a")
+        self.assertEqual(r.returncode, 7)
+        self.assertIn("cannot be restored", r.stderr)
+
+    # 10 help text
+    def test_r10_help_wording(self):
+        out = self.sv("--help").stdout
+        self.assertIn("120", out)
+        self.assertNotIn("always 0", out)
+        self.assertNotIn("takes no lock", self.sv("status", "--help").stdout)
+
+    # 11 a big resource-fork xattr no longer breaks the archive; old archives restore
+    def test_r11_big_resource_fork(self):
+        import ctypes
+        udid = self.create("SVTEST a")
+        f = os.path.join(self.devset, udid, "data", "fork")
+        write(f, "")
+        libc = ctypes.CDLL("libc.dylib", use_errno=True)
+        val = bytes(range(256)) * 4096          # 1 MiB; 900 KB already broke bsdtar
+        self.assertEqual(libc.setxattr(f.encode(), b"com.apple.ResourceFork", val, len(val), 0, 0), 0)
+        r = self.sv("park", "SVTEST a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.sv("restore", "SVTEST a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        g = os.path.join(self.devset, r.stdout.strip(), "data", "fork").encode()
+        self.assertEqual(libc.getxattr(g, b"com.apple.ResourceFork", None, 0, 0, 0), len(val))
+
+    def test_r11_plain_tar_archive_still_restores(self):
+        udid = self.create("SVTEST a")
+        tar = os.path.join(self.vault, "SVTEST a.tar")
+        os.makedirs(self.vault, exist_ok=True)
+        subprocess.run(["/usr/bin/tar", "-C", self.devset, "-cf", tar, udid], check=True)
+        with open(tar, "rb") as h:
+            sha = hashlib.sha256(h.read()).hexdigest()
+        with open(os.path.join(self.vault, "SVTEST a.json"), "w") as h:
+            json.dump({"name": "SVTEST a", "udid": udid, "runtime": RT, "deviceType": "x",
+                       "sha256": sha, "bytes": os.path.getsize(tar), "parkedAt": "old"}, h)
+        self.xcrun("delete", udid)
+        r = self.sv("restore", "SVTEST a")
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 if __name__ == "__main__":
