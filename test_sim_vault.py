@@ -94,6 +94,8 @@ if sub == "list":
     if what == "devices":
         out = {"devices": {}}
         for d in devices():
+            if "available" in rest and not d.get("fakeAvailable", True):
+                continue
             after = d.get("fakeAfter")
             if after:
                 after["lists"] -= 1
