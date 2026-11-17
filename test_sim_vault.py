@@ -215,6 +215,10 @@ if "-cf" in args:
                 os.utime(os.path.join(p, "device.plist"), (0, 0))
         if mode in ("both", "touch"):
             open(os.path.join(p, "data", "boot-marker"), "a").write("x")
+        if os.environ.get("FAKE_TAR_RENAME"):
+            d = plistlib.load(open(os.path.join(p, "device.plist"), "rb"))
+            d["name"] = os.environ["FAKE_TAR_RENAME"]
+            plistlib.dump(d, open(os.path.join(p, "device.plist"), "wb"))
 os.execv("/usr/bin/tar", ["tar"] + args)
 '''
 
@@ -1329,6 +1333,25 @@ class T3Review(SimVaultCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("once more", r.stderr)
         self.assertEqual(self.meta("SVTEST a")["udid"], new)
+
+    def test_z1_retry_refuses_when_renamed_meanwhile(self):
+        self.parked("SVTEST a")
+        new = self.sv("restore", "SVTEST a").stdout.strip()
+        sha = self.tar_sha("SVTEST a")
+        r = self.sv("park", "SVTEST a", FAKE_TAR_BOOT=new, FAKE_TAR_MODE="touch",
+                    FAKE_TAR_ONCE=os.path.join(self.base, "tar-once"),
+                    FAKE_TAR_RENAME="SVTEST renamed")
+        self.assertEqual(r.returncode, 8, r.stderr)
+        self.assertEqual([d["UDID"] for d in self.devices("SVTEST renamed")], [new])
+        self.assertEqual(self.tar_sha("SVTEST a"), sha)
+        self.assert_no_partials()
+
+    def test_z2_failed_boot_withdraws_boot_record(self):
+        udid = self.create("SVTEST a")
+        self.hooks([{"cmd": "boot", "n": 1, "action": "state", "device": udid, "state": "Booted"}])
+        rc, _ = self.js("ensure", "SVTEST a", "--boot", "--lease", "A")
+        self.assertEqual(rc, 1)
+        self.assertIsNone(self.boot_record())
 
     def test_q8_failed_tar_replace_keeps_old_pair(self):
         self.parked("SVTEST a")
