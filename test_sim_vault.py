@@ -252,6 +252,39 @@ if (os.environ.get("SV_TEST_KILL_AFTER_TAR_REPLACE")
                     h.write(b"\0" * 512)
             os.kill(os.getpid(), signal.SIGTERM)
     mod.os.replace = replace
+if os.environ.get("SV_TEST_POSTER_LIMIT_KB"):
+    mod.POSTER_LIMIT_KB = int(os.environ["SV_TEST_POSTER_LIMIT_KB"])
+if os.environ.get("SV_TEST_EXIT_AFTER_TAR_REPLACE"):
+    # SIGKILL stand-in: no handler, no finally, between the tar and the metadata rename.
+    real_replace2 = os.replace
+    def replace_then_die(src, dst):
+        real_replace2(src, dst)
+        if dst.endswith(".tar"):
+            os._exit(137)
+    mod.os.replace = replace_then_die
+if os.environ.get("SV_TEST_NOCACHE_LOG") or os.environ.get("SV_TEST_NOCACHE_FAIL"):
+    import fcntl as real_fcntl, json
+    class FcntlProxy:
+        def __getattr__(self, key):
+            return getattr(real_fcntl, key)
+        def fcntl(self, fd, cmd, arg=0):
+            if cmd == mod.F_NOCACHE:
+                if os.environ.get("SV_TEST_NOCACHE_FAIL"):
+                    raise OSError(45, "Operation not supported")
+                path = real_fcntl.fcntl(fd, 50, b"\0" * 1024).split(b"\0")[0].decode()
+                with open(os.environ["SV_TEST_NOCACHE_LOG"], "a") as h:
+                    h.write(json.dumps({"arg": arg, "path": path,
+                                        "offset": os.lseek(fd, 0, os.SEEK_CUR)}) + "\n")
+            return real_fcntl.fcntl(fd, cmd, arg)
+    mod.fcntl = FcntlProxy()
+if os.environ.get("SV_TEST_LEASE_VANISHES"):
+    # A release deleting a lease between gc's listing and its lstat.
+    real_lstat = os.lstat
+    def lstat(path, *a, **k):
+        if "/leases/" in str(path) and str(path).endswith(".json") and os.path.exists(path):
+            os.remove(path)
+        return real_lstat(path, *a, **k)
+    mod.os.lstat = lstat
 if os.environ.get("SV_TEST_SLOW_REMOVE") or os.environ.get("SV_TEST_FAIL_REMOVE"):
     import time
     real_remove = os.remove
@@ -399,7 +432,7 @@ class T1Core(SimVaultCase):
         meta = self.meta("SVTEST a")
         self.assertEqual(meta["udid"], udid)
         self.assertIn("host", meta)
-        self.assertEqual(meta["toolVersion"], "2")
+        self.assertEqual(meta["toolVersion"], "3")
         r = self.sv("restore", "SVTEST a")
         self.assertEqual(r.returncode, 0, r.stderr)
         new = r.stdout.strip()
@@ -922,7 +955,8 @@ class T2SharedLayer(SimVaultCase):
             h.write(os.urandom(1024 * 1024) * 1025)          # real bytes, not sparse
         rc, d = self.js("park", "SVTEST a", "--shutdown")
         self.assertEqual((rc, d["kind"]), (9, "posterboard-bloated"))
-        self.assertEqual(self.state(udid), "Booted")         # not even shut down
+        self.assertEqual(self.state(udid), "Booted")         # not shut down or deleted
+        self.assertIn("--trim-posterboard", d["next"])
         os.truncate(os.path.join(store, "big"), 900 * 1024 * 1024)
         rc, d = self.js("park", "SVTEST a", "--shutdown")
         self.assertEqual((rc, d["posterMB"]), (0, 900))
@@ -1264,7 +1298,9 @@ class T3Review(SimVaultCase):
         self.assertEqual(self.js("release", "SVTEST a", "--lease", "A", "--shutdown")[0], 0)
         self.assertEqual(self.js("park", "SVTEST a")[0], 0)
         self.assertEqual(self.js("restore", "SVTEST a")[0], 0)
-        self.assertEqual(sorted(set(self.inherited())), ["clone", "delete", "rename"])
+        # shutdown too: a shutdown outliving a killed sim-vault must keep others out.
+        self.assertEqual(sorted(set(self.inherited())), ["clone", "delete", "rename",
+                                                         "shutdown"])
 
     def test_r8_dead_holder_message(self):
         self.create("SVTEST a")
@@ -1418,6 +1454,402 @@ class T3Review(SimVaultCase):
         self.xcrun("delete", udid)
         r = self.sv("restore", "SVTEST a")
         self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class T4V3(SimVaultCase):
+    """v3: read-back without the page cache, history.jsonl, error line, PosterBoard trim,
+    symbol-cache exclusion, gc on odd lease entries, `shutdown`, a park killed between its
+    two renames."""
+    js = T2SharedLayer.js
+    leases_dir = T2SharedLayer.leases_dir
+    mkdir = T1Core.mkdir
+    wait_for = T1Core.wait_for
+    inherited = T3Review.inherited
+
+    def history(self):
+        path = os.path.join(self.home, "Library/Developer/CoreSimulator/sim-vault/history.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path) as h:
+            return [json.loads(line) for line in h]
+
+    def members(self, name):
+        out = subprocess.run(["/usr/bin/tar", "-tf", os.path.join(self.vault, name + ".tar")],
+                             capture_output=True, text=True, check=True).stdout
+        return out.splitlines()
+
+    def put(self, udid, rel, size=10):
+        path = os.path.join(self.devset, udid, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as h:
+            h.write(os.urandom(size))
+        return path
+
+    def nocache_log(self):
+        return os.path.join(self.base, "nocache.jsonl")
+
+    def nocache_calls(self):
+        if not os.path.exists(self.nocache_log()):
+            return []
+        with open(self.nocache_log()) as h:
+            return [json.loads(line) for line in h]
+
+    # -- 1 F_NOCACHE -------------------------------------------------------------------
+    def test_nocache_set_before_first_read(self):
+        self.create("SVTEST a")
+        rc, _ = self.js("park", "SVTEST a", SV_TEST_NOCACHE_LOG=self.nocache_log())
+        self.assertEqual(rc, 0)
+        calls = self.nocache_calls()
+        self.assertEqual([(c["arg"], c["offset"]) for c in calls], [(1, 0)])
+        self.assertTrue(calls[0]["path"].endswith("/SVTEST a.tar.partial"), calls)
+        os.remove(self.nocache_log())
+        rc, _ = self.js("restore", "SVTEST a", SV_TEST_NOCACHE_LOG=self.nocache_log())
+        self.assertEqual(rc, 0)
+        calls = self.nocache_calls()
+        self.assertEqual([(c["arg"], c["offset"]) for c in calls], [(1, 0)])
+        self.assertTrue(calls[0]["path"].endswith("/SVTEST a.tar"), calls)
+
+    def test_nocache_failure_keeps_device_on_park_warns_on_restore(self):
+        self.parked("SVTEST a")
+        new = self.sv("restore", "SVTEST a").stdout.strip()
+        sha = self.tar_sha("SVTEST a")
+        rc, d = self.js("park", "SVTEST a", SV_TEST_NOCACHE_FAIL=1)
+        self.assertEqual(rc, 1)
+        self.assertIn("read caching", d["message"])
+        self.assertEqual([x["UDID"] for x in self.devices("SVTEST a")], [new])
+        self.assertEqual(self.tar_sha("SVTEST a"), sha)
+        self.assert_no_partials()
+        self.xcrun("delete", new)
+        r = self.sv("restore", "SVTEST a", SV_TEST_NOCACHE_FAIL=1)
+        self.assertEqual(r.returncode, 0, r.stderr)        # the checksum still checks the bytes
+        self.assertIn("warning: cannot turn off read caching", r.stderr)
+
+    # -- 2 history.jsonl ---------------------------------------------------------------
+    def test_history_one_line_per_recorded_call(self):
+        udid = self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a")[0], 0)                   # existing
+        self.assertEqual(self.js("park", "SVTEST none", "--missing-ok")[0], 0)  # absent
+        self.assertEqual(self.js("release", "SVTEST a", "--lease", "X")[0], 0)  # no-lease
+        self.assertEqual(self.js("status", "SVTEST a")[0], 0)
+        self.assertEqual(self.js("list")[0], 0)
+        self.assertEqual(self.js("gc", "--dry-run")[0], 0)
+        rc, parked = self.js("park", "SVTEST a")
+        self.assertEqual(rc, 0)
+        rc, restored = self.js("restore", "SVTEST a")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.sv("park").returncode, 2)                          # usage
+        self.assertEqual(self.sv("restore", "SVTEST none").returncode, 3)
+        rc, shut = self.js("shutdown", "SVTEST a")
+        self.assertEqual(rc, 0)
+        h = self.history()
+        self.assertEqual([(x["cmd"], x["rc"], x["action"]) for x in h], [
+            ("ensure", 0, "existing"), ("park", 0, "absent"), ("release", 0, "no-lease"),
+            ("park", 0, "parked"), ("restore", 0, "restored"), ("park", 2, None),
+            ("restore", 3, None), ("shutdown", 0, "already-shutdown")])
+        for x in h:
+            self.assertEqual(set(x), {"ts", "cmd", "name", "udid", "rc", "kind", "action",
+                                      "bytes", "posterMB", "cwd", "pid", "seconds", "phases"})
+        self.assertEqual((h[0]["udid"], h[0]["name"]), (udid, "SVTEST a"))
+        self.assertEqual((h[5]["kind"], h[6]["kind"]), ("usage", "no-archive"))
+        park = h[3]
+        self.assertEqual((park["udid"], park["bytes"], park["posterMB"]),
+                         (udid, parked["bytes"], 0))
+        self.assertEqual(set(park["phases"]), {"lockWait", "shutdownQuiesce", "write",
+                                               "readBack", "delete"})
+        self.assertGreaterEqual(park["seconds"], sum(park["phases"].values()) - 0.01)
+        self.assertEqual(set(h[4]["phases"]), {"lockWait", "extract", "clone"})
+        self.assertEqual(h[4]["udid"], restored["udid"])
+        # --json carries the same timing.
+        self.assertEqual(set(parked["phases"]), set(park["phases"]))
+        self.assertIn("seconds", parked)
+        self.assertIn("seconds", shut)
+
+    def test_history_rc_5_8_9(self):
+        self.create("SVTEST lease")
+        self.assertEqual(self.js("ensure", "SVTEST lease", "--lease", "A")[0], 0)
+        self.assertEqual(self.js("park", "SVTEST lease")[0], 8)
+        udid = self.create("SVTEST poster")
+        self.put(udid, "data/Library/Application Support/PRBPosterExtensionDataStore/x",
+                 200 * 1024)
+        self.assertEqual(self.js("park", "SVTEST poster", SV_TEST_POSTER_LIMIT_KB=64)[0], 9)
+        good_vault = self.vault
+        self.vault = os.path.join(self.base, "unmounted", "vault")
+        self.assertEqual(self.js("park", "SVTEST lease")[0], 5)
+        self.vault = good_vault
+        h = self.history()[1:]
+        self.assertEqual([(x["cmd"], x["rc"], x["kind"]) for x in h], [
+            ("park", 8, "busy"), ("park", 9, "posterboard-bloated"),
+            ("park", 5, "vault-unavailable")])
+        self.assertEqual(h[1]["posterMB"], 0)      # 200 KB rounds down; still recorded
+        self.assertEqual(h[1]["udid"], udid)
+
+    def test_history_on_signal(self):
+        self.create("SVTEST a")
+        p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=30)
+        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        p.send_signal(signal.SIGHUP)
+        _o, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 128 + signal.SIGHUP, err)
+        self.assertIn(f"error (exit {128 + signal.SIGHUP}, interrupted): interrupted by "
+                      f"signal {signal.SIGHUP}; cleaned up", err)
+        self.assertIn("next: rerun", err)
+        h = self.history()
+        self.assertEqual([(x["cmd"], x["rc"], x["kind"]) for x in h],
+                         [("park", 128 + signal.SIGHUP, "interrupted")])
+        self.assertIn("write", h[0]["phases"])
+
+    def test_history_parallel_writers(self):
+        procs = [self.spawn("release", f"SVTEST p{i}", "--lease", "A") for i in range(16)]
+        for p in procs:
+            _o, err = p.communicate(timeout=60)
+            self.assertEqual(p.returncode, 0, err)
+        path = os.path.join(self.home, "Library/Developer/CoreSimulator/sim-vault/history.jsonl")
+        with open(path) as h:
+            lines = h.read().split("\n")
+        self.assertEqual(lines[-1], "")
+        parsed = [json.loads(line) for line in lines[:-1]]
+        self.assertEqual(sorted(x["name"] for x in parsed), sorted(f"SVTEST p{i}"
+                                                                   for i in range(16)))
+        self.assertEqual(len({x["pid"] for x in parsed}), 16)
+
+    def test_history_unwritable_keeps_rc_and_stdout(self):
+        udid = self.create("SVTEST a")
+        os.makedirs(os.path.join(self.home,
+                                 "Library/Developer/CoreSimulator/sim-vault/history.jsonl"))
+        r = self.sv("ensure", "SVTEST a")
+        self.assertEqual((r.returncode, r.stdout), (0, udid + "\n"))
+        self.assertIn("warning: could not write", r.stderr)
+        rc, d = self.js("restore", "SVTEST none")
+        self.assertEqual((rc, d["kind"]), (3, "no-archive"))
+
+    def test_history_counts_both_archive_attempts(self):
+        self.parked("SVTEST a")
+        new = self.sv("restore", "SVTEST a").stdout.strip()
+        rc, d = self.js("park", "SVTEST a", FAKE_TAR_BOOT=new, FAKE_TAR_MODE="touch",
+                        FAKE_TAR_ONCE=os.path.join(self.base, "tar-once"), FAKE_TAR_SLEEP=1)
+        self.assertEqual(rc, 0)
+        self.assertGreaterEqual(d["phases"]["write"], 2.0)
+        self.assertGreaterEqual(self.history()[-1]["phases"]["write"], 2.0)
+
+    def test_parked_message_has_total_and_phases(self):
+        self.create("SVTEST a")
+        r = self.sv("park", "SVTEST a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stderr, r"parked SVTEST a: [\d.]+ GB in \d+s \(lockWait [\d.]+s, "
+                                   r"shutdownQuiesce [\d.]+s, write [\d.]+s, readBack [\d.]+s, "
+                                   r"delete [\d.]+s\); device deleted")
+
+    # -- 3 error line ------------------------------------------------------------------
+    def test_error_line_names_exit_and_kind(self):
+        r = self.sv("restore", "SVTEST none")
+        self.assertIn("sim-vault: error (exit 3, no-archive): no archive for 'SVTEST none'",
+                      r.stderr)
+        self.assertIn("sim-vault: next: ", r.stderr)
+        r = self.sv("park")
+        self.assertIn("error (exit 2, usage): ", r.stderr)
+        # An unexpected exception: a lease file holding a list instead of an object.
+        import hashlib as hl
+        name = "SVTEST a"
+        self.create(name)
+        key = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:60]
+        key += "-" + hl.sha1(name.encode()).hexdigest()[:8]
+        os.makedirs(os.path.join(self.leases_dir(), key))
+        write(os.path.join(self.leases_dir(), key, "bad.json"), "[1]")
+        r = self.sv("ensure", name)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("error (exit 1, unexpected): unexpected ", r.stderr)
+        self.assertIn("next: stop and report this message", r.stderr)
+        self.assertEqual(self.history()[-1]["kind"], "unexpected")
+
+    # -- 4 --trim-posterboard ----------------------------------------------------------
+    def poster_device(self, name="SVTEST a", state="Booted"):
+        udid = self.create(name, state=state)
+        support = "data/Library/Application Support/"
+        self.put(udid, support + "PRBPosterExtensionDataStore/big", 200 * 1024)
+        self.put(udid, support + "com.apple.PosterKit/k")
+        self.put(udid, support + "PRBPosterExtensionDataStore-bak/b")     # same prefix
+        app = "data/Containers/Data/Application/APP1/Library/Application Support/"
+        self.put(udid, app + "PRBPosterExtensionDataStore/app")
+        self.put(udid, app + "com.apple.PosterKit/app")
+        return udid
+
+    def test_trim_posterboard_over_limit(self):
+        udid = self.poster_device()
+        rc, d = self.js("park", "SVTEST a", "--shutdown", SV_TEST_POSTER_LIMIT_KB=64)
+        self.assertEqual(rc, 9)
+        self.assertEqual(self.state(udid), "Booted")
+        rc, d = self.js("park", "SVTEST a", "--shutdown", "--trim-posterboard",
+                        SV_TEST_POSTER_LIMIT_KB=64)
+        self.assertEqual(rc, 0, d)
+        meta = self.meta("SVTEST a")
+        excluded = ["data/Library/Application Support/PRBPosterExtensionDataStore",
+                    "data/Library/Application Support/com.apple.PosterKit"]
+        self.assertEqual((meta["posterboardTrimmed"], meta["excluded"]), (True, excluded))
+        self.assertEqual((d["posterboardTrimmed"], d["excluded"]), (True, excluded))
+        members = self.members("SVTEST a")
+        sys_support = f"{udid}/data/Library/Application Support/"
+        self.assertFalse([m for m in members
+                          if m.startswith(sys_support + "PRBPosterExtensionDataStore/")
+                          or m.startswith(sys_support + "com.apple.PosterKit")], members)
+        self.assertIn(sys_support + "PRBPosterExtensionDataStore-bak/b", members)
+        app = f"{udid}/data/Containers/Data/Application/APP1/Library/Application Support/"
+        self.assertIn(app + "PRBPosterExtensionDataStore/app", members)
+        self.assertIn(app + "com.apple.PosterKit/app", members)
+        r = self.sv("restore", "SVTEST a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_trim_posterboard_under_limit_archives_everything(self):
+        udid = self.poster_device(state="Shutdown")
+        rc, d = self.js("park", "SVTEST a", "--trim-posterboard")
+        self.assertEqual(rc, 0, d)
+        self.assertNotIn("posterboardTrimmed", self.meta("SVTEST a"))
+        self.assertNotIn("excluded", self.meta("SVTEST a"))
+        self.assertIn(f"{udid}/data/Library/Application Support/PRBPosterExtensionDataStore/big",
+                      self.members("SVTEST a"))
+
+    # -- 5 --exclude-symbol-cache ------------------------------------------------------
+    def test_exclude_symbol_cache(self):
+        import ctypes
+        udid = self.create("SVTEST a")
+        cache = "Library/Caches/com.apple.coresymbolicationd/"
+        self.put(udid, "data/" + cache + "sym", 4096)
+        self.put(udid, "data/Containers/Data/Application/APP1/" + cache + "keep")
+        self.put(udid, "data/Containers/Shared/AppGroup/G1/" + cache + "group")
+        self.put(udid, "data/Containers/Shared/AppGroup/G1/Library/data.sqlite")
+        fork = self.put(udid, "data/Containers/Data/Application/APP1/Documents/fork")
+        libc = ctypes.CDLL("libc.dylib", use_errno=True)
+        val = bytes(range(256)) * 4096
+        self.assertEqual(libc.setxattr(fork.encode(), b"com.apple.ResourceFork", val, len(val),
+                                       0, 0), 0)
+        rc, d = self.js("park", "SVTEST a", "--exclude-symbol-cache")
+        self.assertEqual(rc, 0, d)
+        meta = self.meta("SVTEST a")
+        self.assertEqual(meta["excluded"], ["data/Library/Caches/com.apple.coresymbolicationd"])
+        self.assertNotIn("posterboardTrimmed", meta)
+        members = self.members("SVTEST a")
+        self.assertFalse([m for m in members if m.startswith(f"{udid}/data/{cache}")], members)
+        for rel in ("data/Containers/Data/Application/APP1/" + cache + "keep",
+                    "data/Containers/Shared/AppGroup/G1/" + cache + "group",
+                    "data/Containers/Shared/AppGroup/G1/Library/data.sqlite"):
+            self.assertIn(f"{udid}/{rel}", members)
+        out = self.mkdir("extract")
+        subprocess.run(["/usr/bin/tar", "-xf", os.path.join(self.vault, "SVTEST a.tar"), "-C",
+                        out], check=True)
+        g = os.path.join(out, udid, "data/Containers/Data/Application/APP1/Documents/fork")
+        self.assertEqual(libc.getxattr(g.encode(), b"com.apple.ResourceFork", None, 0, 0, 0),
+                         len(val))
+
+    # -- 6 gc and odd lease entries ----------------------------------------------------
+    def test_gc_skips_non_directories_in_leases(self):
+        self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--lease", "A")[0], 0)
+        write(os.path.join(self.leases_dir(), ".DS_Store"), "x")
+        rc, d = self.js("gc", "--dry-run", "--leases-older-than", "0s")
+        self.assertEqual(rc, 0, d)
+        self.assertEqual([a["what"] for a in d["attention"] if a["kind"] == "lease"], ["A"])
+        self.assertTrue(os.path.exists(os.path.join(self.leases_dir(), ".DS_Store")))
+
+    def test_gc_skips_lease_released_meanwhile(self):
+        self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--lease", "A")[0], 0)
+        rc, d = self.js("gc", "--dry-run", "--leases-older-than", "0s",
+                        SV_TEST_LEASE_VANISHES=1)
+        self.assertEqual(rc, 0, d)
+        self.assertEqual([a for a in d["attention"] if a["kind"] == "lease"], [])
+
+    # -- 7 shutdown --------------------------------------------------------------------
+    def test_shutdown_command(self):
+        udid = self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--boot", "--lease", "A")[0], 0)
+        rc, d = self.js("shutdown", "SVTEST a")
+        self.assertEqual((rc, d["kind"]), (8, "busy"))
+        self.assertIn("leased by A", d["message"])
+        self.assertEqual(self.state(udid), "Booted")
+        self.assertEqual(self.count("shutdown"), 0)
+        self.assertEqual(self.js("release", "SVTEST a", "--lease", "A")[0], 0)
+        # Works without the vault: never restores, never reads the archive.
+        self.vault = os.path.join(self.base, "unmounted", "vault")
+        rc, d = self.js("shutdown", "SVTEST a")
+        self.assertEqual((rc, d["action"], d["state"]), (0, "shutdown", "Shutdown"))
+        self.assertEqual(self.state(udid), "Shutdown")
+        self.assertIn("shutdown", self.inherited())     # the simctl child holds the lock
+        rc, d = self.js("shutdown", "SVTEST a")
+        self.assertEqual((rc, d["action"]), (0, "already-shutdown"))
+        rc, d = self.js("shutdown", "SVTEST none")
+        self.assertEqual((rc, d["action"]), (0, "absent"))
+
+    def test_shutdown_respects_busy_lock_and_device_lock(self):
+        import fcntl
+        udid = self.create("SVTEST a", state="Booted")
+        tmpl = os.path.join(self.base, "hl-{udid}.lock")
+        path = tmpl.replace("{udid}", udid)
+        write(path, "")
+        with open(path) as h:
+            fcntl.flock(h, fcntl.LOCK_EX)
+            rc, d = self.js("shutdown", "SVTEST a", "--busy-lock", tmpl)
+            self.assertEqual(rc, 8)
+        self.assertEqual(self.state(udid), "Booted")
+        p = self.spawn("park", "SVTEST a", "--shutdown", FAKE_TAR_SLEEP=3)
+        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        rc, d = self.js("shutdown", "SVTEST a", "--wait", "0.5")
+        self.assertEqual(rc, 8)
+        _o, err = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 0, err)
+        rc, d = self.js("shutdown", "SVTEST a", "--busy-lock", tmpl)
+        self.assertEqual((rc, d["action"]), (0, "absent"))
+
+    # -- 8 killed between the tar and the metadata rename ------------------------------
+    def killed_between_renames(self):
+        self.parked("SVTEST a")
+        new = self.sv("restore", "SVTEST a").stdout.strip()
+        old = self.meta("SVTEST a")
+        r = self.sv("park", "SVTEST a", SV_TEST_EXIT_AFTER_TAR_REPLACE=1)
+        self.assertEqual(r.returncode, 137, r.stderr)
+        self.assertEqual([d["UDID"] for d in self.devices("SVTEST a")], [new])
+        self.assertEqual(self.meta("SVTEST a"), old)                  # old metadata ...
+        self.assertNotEqual(old["sha256"], self.tar_sha("SVTEST a"))  # ... new tar
+        partial = os.path.join(self.vault, "SVTEST a.json.partial")
+        self.assertTrue(os.path.exists(partial))
+        return new, partial
+
+    def test_killed_park_partial_survives_gc_and_restore_pairs_it(self):
+        new, partial = self.killed_between_renames()
+        os.utime(partial, (time.time() - 7200, time.time() - 7200))
+        rc, d = self.js("gc", "--name-prefix", "SVTEST")
+        self.assertEqual((rc, d["deleted"]), (0, []))
+        self.assertIn(partial, [a["what"] for a in d["attention"]])
+        self.assertTrue(os.path.exists(partial))
+        rc, d = self.js("restore", "SVTEST a", SV_TEST_NOCACHE_LOG=self.nocache_log())
+        self.assertEqual((rc, d["action"], d["udid"]), (0, "existing", new))
+        self.assertTrue(self.nocache_calls()[0]["path"].endswith("/SVTEST a.tar"))
+        self.assertFalse(os.path.exists(partial))
+        self.assertEqual(self.meta("SVTEST a")["sha256"], self.tar_sha("SVTEST a"))
+        self.assertEqual(self.meta("SVTEST a")["udid"], new)
+        # The paired archive restores on its own.
+        self.xcrun("delete", new)
+        self.assertEqual(self.js("restore", "SVTEST a")[1]["action"], "restored")
+
+    def test_killed_park_next_park_recollects(self):
+        new, partial = self.killed_between_renames()
+        rc, d = self.js("park", "SVTEST a")
+        self.assertEqual((rc, d["action"]), (0, "parked"))
+        self.assertEqual(self.meta("SVTEST a")["sha256"], self.tar_sha("SVTEST a"))
+        self.assert_no_partials()
+        self.assertEqual(self.devices("SVTEST a"), [])
+        self.assertEqual(self.js("restore", "SVTEST a")[1]["action"], "restored")
+
+    def test_mismatched_partial_is_left_alone(self):
+        new, partial = self.killed_between_renames()
+        with open(partial) as h:
+            data = json.load(h)
+        data["sha256"] = "0" * 64
+        with open(partial, "w") as h:
+            json.dump(data, h)
+        old = self.meta("SVTEST a")
+        rc, d = self.js("restore", "SVTEST a")
+        self.assertEqual((rc, d["action"]), (0, "existing"))
+        self.assertTrue(os.path.exists(partial))
+        self.assertEqual(self.meta("SVTEST a"), old)
 
 
 if __name__ == "__main__":
