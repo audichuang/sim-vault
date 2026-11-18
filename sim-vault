@@ -900,8 +900,9 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace, trim_poste
                        "(modern-ios-guidance, PosterBoard section) and park again")
         log(f"PosterBoard data is over {POSTER_LIMIT_KB // 1024} MB: leaving it out of the "
             "archive (the device itself keeps it until it is deleted)")
-        excluded += POSTER_TRIM
-    if exclude_symbol_cache:
+        excluded += [rel for rel in POSTER_TRIM
+                     if os.path.isdir(os.path.join(DEFAULT_SET, udid, rel))]
+    if exclude_symbol_cache and os.path.isdir(os.path.join(DEFAULT_SET, udid, SYMBOL_CACHE)):
         excluded.append(SYMBOL_CACHE)
     with phase("shutdownQuiesce"):
         if state in ("Booted", "Booting"):
@@ -1561,7 +1562,10 @@ def gc(dry_run=False, leases_older_than=86400, prefix=None):
                     age = time.time() - os.lstat(os.path.join(directory, entry)).st_mtime
                 except FileNotFoundError:
                     continue
-                lease = read_holder(os.path.join(directory, entry)) or {}
+                lease = read_holder(os.path.join(directory, entry))
+                if lease is None and not os.path.exists(os.path.join(directory, entry)):
+                    continue   # released after the lstat
+                lease = lease or {}
                 name = next((d["name"] for d in devices if d["udid"] == lease.get("udid")),
                             None)
                 if prefix and not (wanted(name) or key.startswith(safe_key(prefix)[:len(

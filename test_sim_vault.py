@@ -1585,18 +1585,23 @@ class T4V3(SimVaultCase):
 
     def test_history_on_signal(self):
         self.create("SVTEST a")
-        p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=30)
-        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
-        p.send_signal(signal.SIGHUP)
-        _o, err = p.communicate(timeout=30)
-        self.assertEqual(p.returncode, 128 + signal.SIGHUP, err)
-        self.assertIn(f"error (exit {128 + signal.SIGHUP}, interrupted): interrupted by "
-                      f"signal {signal.SIGHUP}; cleaned up", err)
-        self.assertIn("next: rerun", err)
+        sigs = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+        for sig in sigs:
+            partial = os.path.join(self.vault, "SVTEST a.tar.partial")
+            p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=30)
+            self.wait_for(lambda: os.path.exists(partial))
+            p.send_signal(sig)
+            _o, err = p.communicate(timeout=30)
+            self.assertEqual(p.returncode, 128 + sig, err)
+            self.assertIn(f"error (exit {128 + sig}, interrupted): interrupted by "
+                          f"signal {sig}; cleaned up", err)
+            self.assertIn("next: rerun", err)
+            self.wait_for(lambda: not os.path.exists(partial))
         h = self.history()
         self.assertEqual([(x["cmd"], x["rc"], x["kind"]) for x in h],
-                         [("park", 128 + signal.SIGHUP, "interrupted")])
-        self.assertIn("write", h[0]["phases"])
+                         [("park", 128 + sig, "interrupted") for sig in sigs])
+        for x in h:
+            self.assertIn("write", x["phases"])
 
     def test_history_parallel_writers(self):
         procs = [self.spawn("release", f"SVTEST p{i}", "--lease", "A") for i in range(16)]
@@ -1660,6 +1665,16 @@ class T4V3(SimVaultCase):
         self.assertIn("error (exit 1, unexpected): unexpected ", r.stderr)
         self.assertIn("next: stop and report this message", r.stderr)
         self.assertEqual(self.history()[-1]["kind"], "unexpected")
+
+    def test_trim_records_only_existing_dirs(self):
+        udid = self.create("SVTEST a")
+        self.put(udid, "data/Library/Application Support/PRBPosterExtensionDataStore/big",
+                 200 * 1024)
+        rc, d = self.js("park", "SVTEST a", "--trim-posterboard", "--exclude-symbol-cache",
+                        SV_TEST_POSTER_LIMIT_KB=64)
+        self.assertEqual(rc, 0, d)
+        self.assertEqual(self.meta("SVTEST a")["excluded"],
+                         ["data/Library/Application Support/PRBPosterExtensionDataStore"])
 
     # -- 4 --trim-posterboard ----------------------------------------------------------
     def poster_device(self, name="SVTEST a", state="Booted"):
