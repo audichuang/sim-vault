@@ -48,7 +48,10 @@ def bump(key):
         fcntl.flock(lk, fcntl.LOCK_EX)
         counts = json.load(open(path)) if os.path.exists(path) else {}
         counts[key] = counts.get(key, 0) + 1
-        json.dump(counts, open(path, "w"))
+        tmp = path + ".tmp"
+        with open(tmp, "w") as out:
+            json.dump(counts, out)
+        os.replace(tmp, path)   # readers (count()) never see a half-written file
         return counts[key]
 
 def devices(s=None):
