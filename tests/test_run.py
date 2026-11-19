@@ -107,6 +107,30 @@ class RunTests(SimVaultCase):
         setup = path.read_text().removesuffix("mod.main()\n")
         path.write_text(setup + textwrap.dedent(code) + "\nmod.main()\n")
 
+    def mark_blocked_flock(self):
+        blocked = Path(self.base) / "blocked-flock"
+        self.loader_hook(f"""
+            from pathlib import Path
+            flock = mod.fcntl.flock
+            def report_blocked_flock(fd, operation):
+                try:
+                    return flock(fd, operation)
+                except BlockingIOError:
+                    Path({str(blocked)!r}).touch()
+                    raise
+            mod.fcntl.flock = report_blocked_flock
+        """)
+        return blocked
+
+    def sigterm_exit(self, proc):
+        proc.terminate()
+        try:
+            _, stderr = proc.communicate(timeout=2.5)
+        except subprocess.TimeoutExpired:
+            self.fail("run was still waiting 2.5s after SIGTERM")
+        self.assertEqual(proc.returncode, 143, stderr)
+        return stderr
+
     def test_child_environment_live_lease_and_release_without_shutdown(self):
         udid = self.create(NAME)
         code = """
@@ -153,19 +177,33 @@ sys.stdin.read()
                 self.assertEqual(json.loads(self.result.read_text()),
                                  {"stage": "child", "rc": code, "childRc": code, "teardown": "ok"})
 
-    def test_forwards_signals_sent_only_to_run_and_reaps_child(self):
+    def test_forwards_sigterm_sent_only_to_run_and_reaps_child(self):
         self.create(NAME)
         code = "import os, time; print(os.getpgrp(), flush=True); time.sleep(60)"
-        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        with self.running([PY, "-c", code]) as proc:
+            pgid = int(self.ready(proc))
+            proc.terminate()
+            _, stderr = proc.communicate(timeout=READY_TIMEOUT)
+            self.assertEqual(proc.returncode, 143, stderr)
+            self.assert_summary(stderr, "child", 143, 143, "ok")
+            self.assertEqual(pgid, os.getpgid(0), "child left run's process group")
+            entry = json.loads((self.root / "history.jsonl").read_text().splitlines()[-1])
+            self.assertEqual(entry["signal"], signal.SIGTERM)
+        self.assertEqual(self.leases(), [])
+
+    def test_records_but_does_not_forward_sigint_or_sighup_sent_only_to_run(self):
+        self.create(NAME)
+        code = "import sys; print('ready', flush=True); sys.stdin.read()"
+        for signum in (signal.SIGINT, signal.SIGHUP):
             with self.subTest(signum=signum):
                 with self.running([PY, "-c", code]) as proc:
-                    pgid = int(self.ready(proc))
+                    self.assertEqual(self.ready(proc), "ready")
                     proc.send_signal(signum)
-                    _, stderr = proc.communicate(timeout=READY_TIMEOUT)
-                    rc = 128 + signum
-                    self.assertEqual(proc.returncode, rc, stderr)
-                    self.assert_summary(stderr, "child", rc, rc, "ok")
-                    self.assertEqual(pgid, os.getpgid(0), "child left run's process group")
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        proc.wait(timeout=0.25)
+                    _, stderr = proc.communicate("", timeout=READY_TIMEOUT)
+                    self.assertEqual(proc.returncode, 0, stderr)
+                    self.assert_summary(stderr, "child", 0, 0, "ok")
                     entry = json.loads((self.root / "history.jsonl").read_text().splitlines()[-1])
                     self.assertEqual(entry["signal"], signum)
                 self.assertEqual(self.leases(), [])
@@ -217,7 +255,7 @@ sys.stdin.read()
     def test_bootstatus_stub_keeps_lease_after_run_is_killed(self):
         self.assert_boot_step_keeps_lease("bootstatus")
 
-    def assert_boot_step_keeps_lease(self, step):
+    def pause_boot_step(self, step):
         stub = Path(self.stub) / "xcrun"
         stub.write_text(stub.read_text().replace(
             '            time.sleep(hk["seconds"])',
@@ -228,9 +266,12 @@ sys.stdin.read()
                 os.kill(os.getpid(), signal.SIGSTOP)
             """).strip(), " " * 12),
         ))
-        udid = self.create(NAME)
         self.hooks([{"cmd": step, "n": 1, "action": "sleep", "seconds": 0}])
-        paused = Path(self.fake) / "boot-paused"
+        return Path(self.fake) / "boot-paused"
+
+    def assert_boot_step_keeps_lease(self, step):
+        udid = self.create(NAME)
+        paused = self.pause_boot_step(step)
         with self.running([PY, "-c", "raise SystemExit(65)"], "--boot") as proc:
             self.wait_for(lambda: paused.exists() and paused.stat().st_size,
                           f"stub never paused in {step}")
@@ -252,6 +293,49 @@ sys.stdin.read()
         self.assertEqual(self.sv("ensure", NAME).returncode, 0)
         self.assertEqual(self.leases(), [])
         self.assert_no_shutdown()
+
+    def test_sigterm_interrupts_acquisition_wait_for_device_lock(self):
+        blocked = self.mark_blocked_flock()
+        self.device_lock.parent.mkdir(parents=True)
+        with self.device_lock.open("wb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with self.running([PY, "-c", "raise SystemExit(65)"], "--wait", "20") as proc:
+                try:
+                    self.wait_for(blocked.exists, "acquisition never waited for DeviceLock")
+                    stderr = self.sigterm_exit(proc)
+                    self.assert_summary(stderr, "acquire", 143, None, "-")
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+        self.assertFalse(self.directory.exists())
+
+    def test_sigterm_during_bootstatus_undoes_own_boot(self):
+        udid = self.create(NAME)
+        paused = self.pause_boot_step("bootstatus")
+        stub = Path(self.stub) / "xcrun"
+        stub.write_text(stub.read_text().replace(
+            'elif sub in ("rename", "delete", "boot", "shutdown", "bootstatus", "spawn"):\n',
+            'elif sub in ("rename", "delete", "boot", "shutdown", "bootstatus", "spawn"):\n'
+            '    if sub == "shutdown":\n'
+            '        import signal\n'
+            '        with open(os.path.join(root, "shutdown-ignored"), "w") as ignored:\n'
+            '            json.dump([sig for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)\n'
+            '                       if signal.getsignal(sig) == signal.SIG_IGN], ignored)\n',
+        ))
+        with self.running([PY, "-c", "raise SystemExit(65)"], "--boot") as proc:
+            self.wait_for(lambda: paused.exists() and paused.stat().st_size,
+                          "stub never paused in bootstatus")
+            stub_pid = int(paused.read_text())
+            try:
+                stderr = self.sigterm_exit(proc)
+            finally:
+                if proc.poll() is None:
+                    os.kill(stub_pid, signal.SIGCONT)
+            self.assert_summary(stderr, "acquire", 143, None, "-")
+        calls = [json.loads(line) for line in (Path(self.fake) / "log").read_text().splitlines()]
+        self.assertIn(["simctl", "shutdown", udid], calls)
+        self.assertEqual(json.loads((Path(self.fake) / "shutdown-ignored").read_text()), [])
+        self.assertEqual(self.state(udid), "Shutdown")
+        self.assertEqual(list(self.directory.iterdir()), [])
 
     def test_failed_bootstatus_undoes_own_boot(self):
         udid = self.create(NAME)
@@ -476,12 +560,11 @@ print(leftover.pid, flush=True)
         self.create(NAME)
         self.loader_hook("""
             import signal
-            original_ensure = mod.ensure
-            def interrupt_after_ensure(*args, **kwargs):
-                result = original_ensure(*args, **kwargs)
+            set_inheritable = os.set_inheritable
+            def interrupt_with_lease(fd, inheritable):
+                set_inheritable(fd, inheritable)
                 os.kill(os.getpid(), signal.SIGTERM)
-                return result
-            mod.ensure = interrupt_after_ensure
+            os.set_inheritable = interrupt_with_lease
         """)
         marker = Path(self.base) / "started"
         proc = self.run_sv(f"open({str(marker)!r}, 'w').close()")
@@ -517,10 +600,32 @@ print(leftover.pid, flush=True)
             mod.run_release = signal_during_release
         """)
         proc = self.run_sv("raise SystemExit(65)")
-        self.assertEqual(proc.returncode, 65, proc.stderr)
-        self.assert_summary(proc.stderr, "child", 65, 65, "ok")
+        self.assertEqual(proc.returncode, 130, proc.stderr)
+        self.assert_summary(proc.stderr, "teardown", 130, 65, "failed")
         self.assertFalse(forwarded.exists(), "a signal was forwarded after reaping the child")
+        self.assertEqual(self.sv("ensure", NAME).returncode, 0)
         self.assertEqual(self.leases(), [])
+
+    def test_sigterm_interrupts_teardown_wait_and_next_command_reaps_lease(self):
+        udid = self.create(NAME)
+        blocked = self.mark_blocked_flock()
+        code = "import sys; print('ready', flush=True); sys.stdin.read()"
+        with self.running([PY, "-c", code], "--boot", "--wait", "20") as proc:
+            self.assertEqual(self.ready(proc), "ready")
+            with self.device_lock.open("rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                proc.stdin.close()
+                proc.stdin = None
+                self.wait_for(blocked.exists, "teardown never waited for DeviceLock")
+                stderr = self.sigterm_exit(proc)
+                self.assert_summary(stderr, "teardown", 143, 0, "failed")
+        lease, = self.leases()
+        self.assertFalse(lease["alive"], lease)
+        self.assertTrue(lease["stale"], lease)
+        self.assertEqual(self.sv("ensure", NAME).returncode, 0)
+        self.assertEqual(list(self.directory.iterdir()), [])
+        self.assertEqual(self.state(udid), "Booted")
+        self.assert_no_shutdown()
 
     def test_closed_stderr_pipe_preserves_child_rc(self):
         self.create(NAME)
@@ -706,3 +811,67 @@ print("CHILD_GROUP=" + str(os.getpgrp()), flush=True)
             os.close(tty_fd)
             self.wait_for(lambda: os.waitpid(pid, os.WNOHANG)[0],
                           "job-control shell did not exit after the pty was closed")
+
+    def test_one_terminal_ctrl_c_delivers_one_sigint_to_child(self):
+        self.create(NAME)
+        first = Path(self.base) / "first-sigint"
+        self.loader_hook(f"""
+            import signal, time
+            from pathlib import Path
+            kill = os.kill
+            def after_terminal_delivery(pid, signum):
+                if signum == signal.SIGINT:
+                    # Let the child consume the terminal's signal before any
+                    # forwarding, so separate deliveries cannot coalesce.
+                    deadline = time.monotonic() + 5
+                    while not Path({str(first)!r}).exists():
+                        assert time.monotonic() < deadline, "child did not see terminal signal"
+                        time.sleep(0.01)
+                kill(pid, signum)
+            os.kill = after_terminal_delivery
+        """)
+        code = """
+import signal, sys, time
+from pathlib import Path
+count = 0
+def count_sigint(signum, frame):
+    global count
+    count += 1
+    Path(sys.argv[1]).touch()
+signal.signal(signal.SIGINT, count_sigint)
+print("CHILD_READY", flush=True)
+while count == 0:
+    time.sleep(0.01)
+time.sleep(0.25)
+print(f"SIGINT_COUNT={count}", flush=True)
+"""
+        env = self.env()
+        argv = [PY, self.loader, *self.args((), [PY, "-c", code, str(first)])]
+        pid, tty_fd = pty.fork()
+        if pid == 0:
+            os.execve(PY, argv, env)
+        terminal = bytearray()
+
+        def read_until(marker):
+            deadline = time.monotonic() + READY_TIMEOUT
+            while marker not in terminal:
+                left = deadline - time.monotonic()
+                self.assertTrue(left > 0 and select.select([tty_fd], [], [], left)[0],
+                                terminal.decode(errors="replace"))
+                data = os.read(tty_fd, 4096)
+                self.assertTrue(data, terminal.decode(errors="replace"))
+                terminal.extend(data)
+
+        try:
+            read_until(b"CHILD_READY\r\n")
+            os.write(tty_fd, b"\x03")
+            read_until(b"teardown=ok\r\n")
+            output = terminal.decode(errors="replace")
+            self.assertIn("SIGINT_COUNT=1\r\n", output)
+            self.assertIn("stage=child rc=0 childRc=0 teardown=ok", output)
+            entry = json.loads((self.root / "history.jsonl").read_text().splitlines()[-1])
+            self.assertEqual(entry["signal"], signal.SIGINT)
+        finally:
+            os.close(tty_fd)
+            self.wait_for(lambda: os.waitpid(pid, os.WNOHANG)[0],
+                          "run did not exit after the pty was closed")

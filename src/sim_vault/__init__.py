@@ -157,10 +157,15 @@ class Interrupted(BaseException):
         self.signum = signum
 
 
+def ignore_during_cleanup(_signum, _frame):
+    pass
+
+
 def on_signal(signum, _frame):
-    # Ignore every further signal so the cleanup that follows is not cut short.
-    for other in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-        signal.signal(other, signal.SIG_IGN)
+    # A caught handler shields this process during cleanup and resets on exec,
+    # so subprocesses launched for rollback keep their usual signal handling.
+    for other in RUN_SIGNALS:
+        signal.signal(other, ignore_during_cleanup)
     raise Interrupted(signum)
 
 
@@ -1834,22 +1839,17 @@ def signal_run_child(pid, signum):
 def run_command(args, command, outcome):
     owner = f"{args.lease}:{os.getpid()}-{secrets.token_hex(3)}"
     acquired = child = None
-    pending = received = None
     rc, kind = EXIT_ERROR, "child"
 
-    def forward(signum, _frame):
-        nonlocal pending, received
-        received = signum
-        if child is None:
-            pending = signum
-        elif child.returncode is None:
+    def on_child_signal(signum, frame):
+        if child is None or child.returncode is not None:
+            on_signal(signum, frame)
+        note(signal=signum)
+        # The child shares the shell job and receives terminal signals directly.
+        if signum == signal.SIGTERM:
             signal_run_child(child.pid, signum)
 
     try:
-        # Defer interruptions until the lease is safely in this scope. A signal
-        # during Popen is delivered once it returns with the child PID.
-        for signum in RUN_SIGNALS:
-            signal.signal(signum, forward)
         acquired = ensure(args.name, args.create, args.boot, owner, args.exclusive,
                           args.wait, args.deny_other_leases, args.allow_lease,
                           held_lease=True, expect_udid=args.expect_udid)
@@ -1858,8 +1858,6 @@ def run_command(args, command, outcome):
         os.set_inheritable(fd, True)
         env = dict(os.environ, SIM_VAULT_NAME=args.name, SIM_VAULT_UDID=udid,
                    SIM_VAULT_LEASE=owner, SIM_VAULT_LEASE_FD=str(fd))
-        if pending is not None:
-            raise Interrupted(pending)
         outcome["stage"] = "child"
         with phase("child"):
             try:
@@ -1870,30 +1868,32 @@ def run_command(args, command, outcome):
                 rc = outcome["childRc"] = 127 if isinstance(exc, FileNotFoundError) else 126
                 log(f"cannot start {command[0]!r}: {exc}")
             else:
-                if pending is not None:
-                    signal_run_child(child.pid, pending)
+                for signum in RUN_SIGNALS:
+                    signal.signal(signum, on_child_signal)
                 child_rc = child.wait()
-                child = None
                 rc = outcome["childRc"] = 128 - child_rc if child_rc < 0 else child_rc
     except Interrupted as exc:
         rc, kind = 128 + exc.signum, "interrupted"
-        received = exc.signum
+        note(signal=exc.signum)
         log(f"error (exit {rc}, {kind}): interrupted by signal {exc.signum}")
     except Exception as exc:
         if acquired is None:
             raise
         log(f"error (exit {rc}, {kind}): {exc}")
     finally:
-        child = None
-        for signum in RUN_SIGNALS:
-            signal.signal(signum, signal.SIG_IGN)
-        if received is not None:
-            note(signal=received)
         if acquired is not None:
             try:
+                child = None
+                for signum in RUN_SIGNALS:
+                    signal.signal(signum, on_signal)
                 with phase("teardown"):
                     run_release(args.name, owner, acquired["udid"], acquired["leaseFd"], args.wait)
                 outcome["teardown"] = "ok"
+            except Interrupted as exc:
+                outcome.update(stage="teardown", teardown="failed")
+                rc, kind = 128 + exc.signum, "interrupted"
+                note(signal=exc.signum)
+                log(f"error (exit {rc}, {kind}): teardown interrupted by signal {exc.signum}")
             except Exception as exc:
                 failure = exc if isinstance(exc, Fail) else Fail(str(exc), kind="teardown")
                 outcome["teardown"] = ("held-by-other" if failure.kind == "held-by-other"
@@ -2340,6 +2340,8 @@ def build_parser():
                        epilog="""The command receives SIM_VAULT_NAME, SIM_VAULT_UDID, SIM_VAULT_LEASE
 (the full owner) and SIM_VAULT_LEASE_FD. Its stdout goes directly to the caller.
 The shell manages job control for run and the command as one job.
+While waiting, run records SIGINT and SIGHUP sent to its PID alone.
+Send SIGTERM to run's PID to forward it to the command.
 
 Python launchers must pass the lease descriptor via pass_fds=(fd,), where
 fd = int(os.environ["SIM_VAULT_LEASE_FD"]). Background helpers must close it:

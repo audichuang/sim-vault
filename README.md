@@ -74,8 +74,11 @@ helpers must close the descriptor. In bash, use numeric redirection for macOS
 eval "helper ... ${SIM_VAULT_LEASE_FD}>&- &"
 ```
 
-The shell manages job control for `run` and its command as one job. The final
-stderr line and optional `--result-file` JSON give the stage, exit code, child
+The shell manages job control for `run` and its command as one job. While
+waiting, `run` only records SIGINT and SIGHUP sent to its PID alone. Send
+SIGTERM to that PID to forward it to the command.
+
+The final stderr line and optional `--result-file` JSON give the stage, exit code, child
 exit code and teardown result. Teardown leaves the device running. If a
 background process still holds the lock, `run` reports `teardown=held-by-other`
 and leaves the process running. Use the reported `lsof <lock path>` command
