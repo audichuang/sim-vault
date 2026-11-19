@@ -289,6 +289,15 @@ if os.environ.get("SV_TEST_LISTDIR_FAIL_FROM"):
                 raise OSError(5, "simulated EIO", p)
         return real_listdir(p)
     mod.os.listdir = listdir
+if os.environ.get("SV_TEST_TAR_STAT_EIO"):
+    # EIO from stat (and so os.path.exists) of the vault's <name>.tar.
+    real_stat = os.stat
+    def stat_eio(p, *a, **k):
+        if str(p).endswith(".tar") and os.path.realpath(os.path.dirname(str(p))) == \
+                os.path.realpath(os.environ["SIM_VAULT_DIR"]):
+            raise OSError(5, "simulated EIO", p)
+        return real_stat(p, *a, **k)
+    mod.os.stat = stat_eio
 if os.environ.get("SV_TEST_RAISE_IN"):
     def boom(*a, **k):
         raise RuntimeError("injected")
@@ -2168,6 +2177,30 @@ class T4V3(SimVaultCase):
         self.assertEqual((self.meta("SVTEST a"), self.tar_sha("SVTEST a")), (old, sha))
         self.assertEqual(self.partials("json"), [partial])
         self.assertEqual([x["UDID"] for x in self.devices("SVTEST a")], [new])
+
+    # -- final round ----------------------------------------------------------------------
+    def test_tar_stat_eio_is_unknown_not_absent(self):
+        new, partial = self.killed_between_renames()
+        os.utime(partial, (time.time() - 7200, time.time() - 7200))
+        rc, d = self.js("gc", "--name-prefix", "SVTEST", SV_TEST_TAR_STAT_EIO=1)
+        self.assertEqual((rc, d["deleted"]), (0, []))
+        self.assertTrue(os.path.exists(partial))
+        self.assertIn(partial, [a["what"] for a in d["attention"]])
+        old, sha = self.meta("SVTEST a"), self.tar_sha("SVTEST a")
+        rc, d = self.js("park", "SVTEST a", SV_TEST_TAR_STAT_EIO=1)
+        self.assertEqual((rc, d["kind"]), (1, "pending-pair"))
+        self.assertEqual((self.meta("SVTEST a"), self.tar_sha("SVTEST a")), (old, sha))
+        self.assertEqual(self.partials("json"), [partial])
+        self.assertEqual([x["UDID"] for x in self.devices("SVTEST a")], [new])
+
+    def test_busy_by_lease_next_says_when_release_is_ok(self):
+        self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--lease", "A")[0], 0)
+        for args in (("park", "SVTEST a"), ("shutdown", "SVTEST a"),
+                     ("ensure", "SVTEST a", "--lease", "B", "--deny-other-leases")):
+            rc, d = self.js(*args)
+            self.assertEqual(rc, 8, args)
+            self.assertIn("worktree no longer exists or that session has ended", d["next"])
 
 
 if __name__ == "__main__":

@@ -684,10 +684,15 @@ def blocking_leases(name, lease=None, exclusive=False):
     return [l for l in others if exclusive or l.get("mode") == "exclusive"]
 
 
+def stale_lease_hint(name):
+    return ("release someone else's lease only once its owner's worktree no longer exists or "
+            "that session has ended: "
+            f"`sim-vault release '{name}' --lease <owner>`")
+
+
 def leased_fail(name, leases):
     return Fail(f"'{name}' is leased by {describe_leases(leases)}", EXIT_BUSY, "busy",
-                "wait for that run to finish; if its lease is left over from a run "
-                f"that died, `sim-vault release '{name}' --lease <owner>`")
+                f"wait for that run to finish; {stale_lease_hint(name)}")
 
 
 def remove_file(path):
@@ -847,9 +852,16 @@ def partial_token():
 def pending_meta_partials(tar_path, meta_path):
     """Metadata .partial files whose park was killed between its two renames: the tar of
     the same run is in place (its .partial is gone), the metadata is not. Files only.
-    None when the vault cannot be listed: unknown is not the same as "none"."""
-    if not os.path.exists(tar_path):
+    None when the vault cannot be listed or the tar cannot be stat'ed: unknown is not the
+    same as "none"."""
+    try:
+        os.stat(tar_path)
+    except FileNotFoundError:
         return []
+    except OSError as exc:
+        log(f"warning: cannot stat {tar_path} to look for metadata of an interrupted park: "
+            f"{exc}")
+        return None
     vault, base = os.path.split(meta_path)
     stem = base[:-len(".json")]
     out = []
@@ -936,8 +948,7 @@ def park(name, shutdown=False, replace=False, wait=DEFAULT_WAIT, busy_locks=(),
         leases = read_leases(name, strict=True)
         if leases:
             raise Fail(f"'{name}' is leased by {describe_leases(leases)}", EXIT_BUSY, "busy",
-                       "wait for those runs to finish; if a lease is left over from a run that "
-                       f"died, `sim-vault release '{name}' --lease <owner>`")
+                       f"wait for those runs to finish; {stale_lease_hint(name)}")
         held = hold_busy_locks(busy_locks, udid)
         try:
             result = park_locked(name, device, tar_path, meta_path, shutdown, replace,
@@ -1453,9 +1464,8 @@ def shutdown_command(name, wait=DEFAULT_WAIT, busy_locks=()):
         if leases:
             raise Fail(f"'{name}' is leased by {describe_leases(leases)}; not shutting down",
                        EXIT_BUSY, "busy",
-                       "it is still in use; release your own lease first, wait for the others, "
-                       f"or if a lease is left over from a run that died, `sim-vault release "
-                       f"'{name}' --lease <owner>`")
+                       "it is still in use; release your own lease first and wait for the "
+                       f"others; {stale_lease_hint(name)}")
         held = hold_busy_locks(busy_locks, udid)
         try:
             # Read the state again now that every lock is held: the device may have been
