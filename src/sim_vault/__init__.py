@@ -371,7 +371,7 @@ def vault_dir():
                    "parking there would not free any space", EXIT_NO_VAULT,
                    "vault-unavailable", retry)
     try:
-        os.makedirs(path, exist_ok=True)
+        os.makedirs(path, mode=0o700, exist_ok=True)
     except OSError as exc:
         raise Fail(f"cannot create {path}: {exc}", EXIT_NO_VAULT, "vault-unavailable", retry)
     if not os.access(path, os.W_OK):
@@ -407,8 +407,20 @@ def read_meta(meta_path):
     return meta
 
 
-def write_json(path, data):
-    with open(path + ".partial", "w") as handle:
+def open_private(path, mode="w"):
+    """Open path for writing with mode 0600 from creation, before any data is written."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, mode)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def write_json(path, data, *, private=False):
+    opener = open_private if private else open
+    with opener(path + ".partial", "w") as handle:
         json.dump(data, handle, indent=2)
     os.replace(path + ".partial", path)
 
@@ -1288,7 +1300,7 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace, keep_poste
                 proc = subprocess.Popen(["tar", "--no-xattrs", "--mac-metadata", *exclude_args,
                                          "-C", DEFAULT_SET, "-cf", "-", udid],
                                         stdout=subprocess.PIPE, pass_fds=tuple(HELD_FDS))
-                with open(partial, "wb") as out:
+                with open_private(partial, "wb") as out:
                     for chunk in iter(lambda: proc.stdout.read(CHUNK), b""):
                         digest.update(chunk)
                         out.write(chunk)
@@ -1343,7 +1355,7 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace, keep_poste
             meta["excluded"] = excluded
         if any(rel in POSTER_TRIM for rel in excluded):
             meta["posterboardTrimmed"] = True
-        with open(meta_partial, "w") as handle:
+        with open_private(meta_partial, "w") as handle:
             json.dump(meta, handle, indent=2)
         # Replace the previous archive only after the new one is verified.
         os.replace(partial, tar_path)
@@ -1520,7 +1532,7 @@ def restore_locked(name, warnings=None):
         # rename, so a finished restore always has it.
         meta["restoredAs"] = udid
         try:
-            write_json(meta_path, meta)
+            write_json(meta_path, meta, private=True)
         except OSError as exc:
             raise Fail(f"could not record the restored UDID in {meta_path}: {exc}; "
                        "the half-restored device was deleted", kind="vault-write",
