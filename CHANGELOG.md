@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Newly created vault directories use mode `0700`, and newly created vault files (`.tar`,
+  `.json` and their `.partial` files) are opened with mode `0600` from the start. Existing
+  vault directories and archives, as well as state files under
+  `~/Library/Developer/CoreSimulator/sim-vault/`, keep their current permissions.
+
 ## 3.1.0
 
 - Packaged as a standalone repository: `src/sim_vault/`, installable with
