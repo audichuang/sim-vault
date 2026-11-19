@@ -23,9 +23,12 @@ commands (see `sim-vault <command> --help` for flags):
   shutdown <name>  shut the device down under the lock unless a lease is held (8); for
                    project `down` scripts, after releasing their own lease
   release <name>   drop a lease; with --shutdown the last lease shuts down what ensure booted
+  whoami <name>    show this session's anchor and lease token without taking the device lock
   list             archives in the vault
   gc               remove what interrupted runs left behind (dry-run first)
 Held leases protect a device while a process holds their lock and expire when it exits.
+For manual sessions, use ensure and release with --lease auto --lease-scope DIR.
+Ensure also takes --lease-prefix PREFIX for the token. Use whoami --lease-scope DIR to find it.
 Commands other than run take --json: stdout is then exactly one JSON object, also on failure:
 {"ok": false, "code": 5, "kind": "vault-unavailable", "message": "...", "next": "..."}.
 Messages go to stderr; a failure ends with "error (exit N, <kind>): <message>" and a
@@ -38,7 +41,7 @@ volume than ~/Library/Developer/CoreSimulator, so an unmounted share is refused 
 silently filling the local disk. Locks, leases and staging live in
 ~/Library/Developer/CoreSimulator/sim-vault/ (fixed paths, not $TMPDIR). Every ensure,
 restore, park, release, shutdown and run appends one JSON line (ts, cmd, name, udid, rc,
-kind, action, bytes, posterMB, cwd, pid, seconds, phases) to history.jsonl, also on failure
+kind, leaseKind, action, bytes, posterMB, cwd, pid, seconds, phases) to history.jsonl, also on failure
 and on SIGTERM/SIGHUP/SIGINT; a history that cannot be written only warns. $SIM_VAULT_HISTORY
 overrides the path of history.jsonl (default: that directory).
 
@@ -94,7 +97,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "3.1.0"
+__version__ = "4.0.0"
 TOOL_VERSION = "3"
 DEFAULT_VAULT = "/Volumes/WorkSpace/ios-sim"
 SIM_ROOT = os.path.expanduser("~/Library/Developer/CoreSimulator")
@@ -797,6 +800,151 @@ def process_identity(pid):
     return start, os.fsdecode(info.name or info.comm)
 
 
+SESSION_ANCESTOR_COMMS = {"claude", "codex", "login", "sshd", "sshd-session", "tmux"}
+
+
+def ps_output(*args):
+    try:
+        result = subprocess.run(["/bin/ps", *args], capture_output=True, text=True,
+                                errors="replace", env=dict(os.environ, LC_ALL="C", TZ="UTC"),
+                                timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def comm_basename(comm):
+    return os.path.basename(comm).lstrip("-")
+
+
+def process_ancestors():
+    processes = {}
+    for row in ps_output("-axww", "-o", "pid=,ppid=,comm=").splitlines():
+        pid, parent, comm = row.split(None, 2)
+        processes[int(pid)] = int(parent), comm_basename(comm)
+    pid = os.getpid()
+    ancestors = {}
+    while pid in processes:
+        parent, _ = processes[pid]
+        if parent not in processes or parent in ancestors:
+            break
+        ancestors[parent] = processes[parent][1]
+        pid = parent
+    return ancestors
+
+
+def env_pid(key):
+    try:
+        pid = int(os.environ.get(key, ""))
+    except ValueError:
+        return None
+    return pid if 0 < pid < 2**31 else None
+
+
+def ps_identity(pid):
+    parts = ps_output("-ww", "-p", str(pid), "-o", "lstart=,comm=").split(None, 5)
+    if len(parts) == 6:
+        return " ".join(parts[:5]), parts[5].strip()
+    return None
+
+
+def anchor_record(pid, found_by, comm=None):
+    identity = process_identity(pid)
+    source = "proc_pidinfo"
+    if identity is None:
+        identity = ps_identity(pid)
+        source = "ps" if identity is not None else None
+    start, observed_comm = identity if identity is not None else (None, None)
+    return {"pid": pid, "startedAt": start, "startSource": source,
+            "comm": comm or (comm_basename(observed_comm) if observed_comm else None),
+            "foundBy": found_by}
+
+
+def session_anchor():
+    override = env_pid("SIM_VAULT_ANCHOR_PID")
+    if override is not None:
+        return anchor_record(override, "SIM_VAULT_ANCHOR_PID")
+    ancestors = process_ancestors()
+    claude = env_pid("CLAUDE_PID")
+    if claude in ancestors:
+        return anchor_record(claude, "CLAUDE_PID", ancestors[claude])
+    # Codex exposes session/thread IDs rather than a PID. Its comm is on this allow-list.
+    for pid, comm in ancestors.items():
+        if comm in SESSION_ANCESTOR_COMMS:
+            return anchor_record(pid, "ancestor", comm)
+    return None
+
+
+def same_anchor(first, second):
+    if first is None or second is None:
+        return first is second
+    return (first["pid"] == second["pid"] and first["startedAt"] is not None
+            and first["startSource"] == second["startSource"]
+            and first["startedAt"] == second["startedAt"])
+
+
+def anchor_alive(anchor):
+    if anchor is None:
+        return True
+    pid = anchor["pid"]
+    if not pid_alive(pid):
+        return False
+    identity = None
+    if anchor["startSource"] == "proc_pidinfo":
+        identity = process_identity(pid)
+    elif anchor["startSource"] == "ps":
+        identity = ps_identity(pid)
+    return identity is None or identity[0] == anchor["startedAt"]
+
+
+def session_lease(leases, scope, anchor=None):
+    return next((l for l in leases if l.get("kind") == "session" and l.get("scope") == scope
+                 and (anchor is None or same_anchor(l.get("anchor"), anchor))), None)
+
+
+def whoami(name, scope, anchor):
+    directory = lease_dir(name)
+    leases = read_lease_files(directory, lease_entries(directory), quiet=True)
+    lease = session_lease(leases, scope, anchor)
+    return {"anchor": anchor, "lease": lease["owner"] if lease else None}
+
+
+def session_busy(name, lease, caller_anchor):
+    anchor = lease.get("anchor")
+    anchor_state = "unknown" if anchor is None else "alive" if anchor_alive(anchor) else "exited"
+    scope_state = "exists" if os.path.isdir(lease["scope"]) else "missing"
+    age = lease_age(lease)
+    age_text = f"{age:.0f}s" if age is not None else "unknown"
+    resume = (" It may be your own lease from before a resume."
+              if not same_anchor(anchor, caller_anchor) else "")
+    owner = lease["owner"]
+    return Fail(f"'{name}' already has session lease {owner} for this scope "
+                f"(age {age_text}, anchor {anchor_state}, scope {scope_state}).{resume}",
+                EXIT_BUSY, "busy", shlex.join(["sim-vault", "release", name, "--lease", owner]))
+
+
+def legacy_scope_lease(name, scope, leases):
+    """Keep the old DayDo/DSA owner-file guard during the wrapper transition."""
+    scope_key = hashlib.sha1(os.fsencode(scope)).hexdigest()
+    if name.startswith("DD "):
+        aliases = {"DD iPhone 18 Pro": "iphone", "DD iPad Pro 11": "ipad"}
+        target = aliases.get(name, re.sub(r"[^A-Za-z0-9]", "_", name))
+        filename = f"daydo-{scope_key}-{target}"
+    elif name.startswith("DSA ") and "/" not in name:
+        filename = f"dsa-{scope_key}-{name.replace(' ', '-')}"
+    else:
+        return None
+    path = os.path.join(STATE_ROOT, "owners", filename)
+    try:
+        with open(path, encoding="utf-8", errors="surrogateescape") as handle:
+            owner = handle.read().rstrip("\n")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise unreadable_lease(path, exc) from exc
+    return next((l for l in leases if l["owner"] == owner), None)
+
+
 def verified_held_holder(lease):
     if not lease["alive"] or lease.get("unreadable") or lease.get("pidStartedAt") is None:
         return None
@@ -938,10 +1086,9 @@ def remove_file(path):
 
 
 def drop_stale_leases(name, present_udids):
-    """Leases and the boot record pointing at a device that no longer exists are left over
-    from a run that died (or a device parked by hand); drop them. Caller holds the lock."""
+    """Drop legacy leases and boot records whose devices are gone. Caller holds the lock."""
     for lease in read_leases(name):
-        if lease.get("kind") != "held" and lease.get("udid") not in present_udids:
+        if lease.get("kind") not in ("held", "session") and lease.get("udid") not in present_udids:
             log(f"dropping lease of {lease.get('owner')}: device {lease.get('udid')} is gone")
             remove_file(lease["file"])
     record = read_boot_record(name)
@@ -1613,10 +1760,21 @@ def restore(name, wait=DEFAULT_WAIT):
 
 
 def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFAULT_WAIT,
-           deny_other_leases=False, allow_leases=(), *, held_lease=False, expect_udid=None):
+           deny_other_leases=False, allow_leases=(), *, held_lease=False, expect_udid=None,
+           session=None, lease_prefix=None):
     warnings = []
+    if lease:
+        note(leaseKind="session" if session is not None else "held" if held_lease else "legacy")
     with DeviceLock(name, wait), ExitStack() as held_fd:
         fd = None
+        if session is not None:
+            previous = session_lease(read_leases(name), session["scope"])
+            if previous:
+                raise session_busy(name, previous, session["anchor"])
+            lease = f"{lease_prefix or 'auto'}:{secrets.token_hex(4)}"
+            if os.path.lexists(lease_path(name, lease)):
+                raise Fail(f"'{name}' already has a lease for {lease}", EXIT_BUSY, "busy",
+                           "rerun to generate a new session token")
         held, _ = reap_held_leases(lease_dir(name))
         same_owner = same_held_owner(name, lease, held)
         if same_owner:
@@ -1644,9 +1802,18 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
         devices = all_devices()
         drop_stale_leases(name, {d["udid"] for d in devices})
         reconcile_boot_record(name, devices)
-        legacy = [l for l in read_leases(name) if l.get("kind") != "held"]
-        mine = [l for l in legacy if l.get("owner") == lease] if lease else []
-        blocking = blocking_leases(legacy, lease, exclusive)
+        manual = [l for l in read_leases(name) if l.get("kind") != "held"]
+        mine = [l for l in manual if l.get("owner") == lease] if lease else []
+        if mine and mine[0].get("kind") == "session":
+            note(leaseKind="session")
+            raise leased_fail(name, mine)
+        if session is not None:
+            previous = legacy_scope_lease(name, session["scope"], manual)
+            if previous:
+                raise Fail(f"'{name}' has a legacy lease {previous['owner']} recorded for this scope",
+                           EXIT_BUSY, "busy",
+                           shlex.join(["sim-vault", "release", name, "--lease", previous["owner"]]))
+        blocking = blocking_leases(manual, lease, exclusive)
         if blocking:
             raise leased_fail(name, blocking)
         if deny_other_leases:
@@ -1678,6 +1845,8 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
             else:
                 record = {"owner": lease, "udid": udid, "pid": os.getppid(), "createdAt": stamp,
                           "updatedAt": stamp, "mode": "exclusive" if exclusive else "shared"}
+                if session is not None:
+                    record.update(kind="session", **session)
                 wrote_new = True
             # The lease goes in before booting, so a device we boot always has an owner.
             if held_lease:
@@ -1743,22 +1912,33 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
         return result
 
 
-def release(name, lease, shutdown=False, wait=DEFAULT_WAIT):
+def release(name, lease, shutdown=False, wait=DEFAULT_WAIT, *, session=None):
+    if session is not None:
+        note(leaseKind="session")
     with DeviceLock(name, wait):
-        return release_locked(name, lease, shutdown)
+        return release_locked(name, lease, shutdown, session=session)
 
 
-def release_locked(name, lease, shutdown=False, *, held_udid=None):
+def release_locked(name, lease, shutdown=False, *, held_udid=None, session=None):
     directory = lease_dir(name)
     snapshot = lease_snapshot(directory, quiet=True)
-    path = lease_path(name, lease)
+    if session is not None:
+        match = session_lease(snapshot[0], **session)
+        lease = match["owner"] if match else None
+    path = lease_path(name, lease) if lease is not None else None
     if held_udid is not None:
         # run holds the lease flock here and removes its lock file after release.
         snapshot = (snapshot[0], [l for l in snapshot[1]
                                   if l["lockFile"] != held_lock_path(path)], snapshot[2])
+    else:
+        existing = next((l for l in snapshot[0] if l["file"] == path), None)
+        if existing:
+            kind = existing.get("kind")
+            note(leaseKind=kind if kind in ("session", "held") else "legacy")
     held = [l for l in snapshot[1] if l["alive"]]
     blocking = same_held_owner(name, lease, held)
     if blocking:
+        note(leaseKind="held")
         raise held_leased_fail(name, blocking)
     if shutdown:
         require_readable_held(held)
@@ -1769,12 +1949,12 @@ def release_locked(name, lease, shutdown=False, *, held_udid=None):
         note(udid=device["udid"])
     drop_stale_leases(name, {d["udid"] for d in devices})
     record = reconcile_boot_record(name, devices)
-    existed = os.path.exists(path)
+    existed = path is not None and os.path.exists(path)
     # Strict with --shutdown: an unreadable lease may be someone's live one.
-    legacy = [l for l in read_leases(name, strict=shutdown) if l.get("kind") != "held"]
-    others = [l for l in legacy if l.get("owner") != lease] + held
+    manual = [l for l in read_leases(name, strict=shutdown) if l.get("kind") != "held"]
+    others = [l for l in manual if l.get("owner") != lease] + held
     mine = ({"udid": held_udid} if held_udid is not None
-            else next((l for l in legacy if l["file"] == path), None))
+            else next((l for l in manual if l["file"] == path), None))
     same_device = bool(record and mine and mine.get("udid") == record.get("udid"))
     responsible = same_device and lease in record.get("by", [])
     did_shutdown = False
@@ -1788,12 +1968,13 @@ def release_locked(name, lease, shutdown=False, *, held_udid=None):
     elif shutdown and others:
         log(f"not shutting down: still leased by {describe_leases(others)}")
     elif shutdown and not existed:
-        log(f"not shutting down: {lease} holds no lease on it")
+        log(f"not shutting down: {lease or 'this session'} holds no lease on it")
     elif shutdown:
         log("not shutting down: sim-vault did not boot it under this lease")
     if same_device and not did_shutdown:
         release_boot_record(boot_record_path(name), record, [lease], others)
-    remove_file(path)
+    if path is not None:
+        remove_file(path)
     return {"action": "released" if existed else "no-lease", "lease": lease,
             "shutdown": did_shutdown, "remaining": [lease_view(l) for l in others]}
 
@@ -1965,13 +2146,15 @@ def lease_age(lease):
 
 
 def status_lease(lease, present):
-    held = lease.get("kind") == "held"
+    kind = lease.get("kind")
+    held = kind == "held"
+    session = kind == "session"
     alive = lease["alive"] if held else True
     age = lease_age(lease)
-    view = dict(lease_view(lease), kind="held" if held else "legacy", alive=alive,
+    view = dict(lease_view(lease), kind=kind if held or session else "legacy", alive=alive,
                 ageSeconds=round(age) if age is not None else None,
                 overdue=not held and age is not None and age > 4 * 3600,
-                stale=not alive if held else lease.get("udid") not in present)
+                stale=not alive if held else not session and lease.get("udid") not in present)
     if held:
         if view["owner"] is None:
             view["owner"] = held_label(lease)
@@ -1981,6 +2164,9 @@ def status_lease(lease, present):
             view["unreadable"] = lease["unreadable"]
         elif alive and not holder:
             view["holderHint"] = f"{describe_held(lease, None)}. {held_candidate_hint(lease)}"
+    if session:
+        view.update(anchor=lease["anchor"], scope=lease["scope"],
+                    anchorAlive=anchor_alive(lease["anchor"]), scopeExists=os.path.isdir(lease["scope"]))
     return view
 
 
@@ -2301,6 +2487,10 @@ def build_parser():
         p.add_argument("--wait", type=float, default=DEFAULT_WAIT,
                        help="seconds to wait for the device lock (default 60), then exit 8")
 
+    def scope_flag(p, *, required=False):
+        p.add_argument("--lease-scope", metavar="DIR", required=required,
+                       help="worktree directory for the session lease, resolved to its real path")
+
     def acquisition_flags(p, *, held=False):
         p.add_argument("--create", metavar="TYPE",
                        help="on 3/4, create it with this device type (name or identifier) and the "
@@ -2332,7 +2522,10 @@ def build_parser():
     p.add_argument("name")
     p.add_argument("--lease", metavar="OWNER",
                    help="register OWNER as using the device until `release`; park refuses "
-                        "(8) while any lease exists. Recorded before booting")
+                        "(8) while any lease exists. Use --lease auto --lease-scope DIR "
+                        "to generate a session owner. Recorded before booting")
+    scope_flag(p)
+    p.add_argument("--lease-prefix", metavar="PREFIX", help="session token prefix (default auto)")
     acquisition_flags(p)
     p = sub.add_parser("run", help="run a command under a held simulator lease",
                        usage="%(prog)s <name> --lease PREFIX [options] -- <cmd...>",
@@ -2407,11 +2600,16 @@ Use --result-file to get the same fields as JSON.""")
     wait_flag(p)
     p = add("release", "drop OWNER's lease on <name>; exit 0 when there is none")
     p.add_argument("name")
-    p.add_argument("--lease", metavar="OWNER", required=True)
+    p.add_argument("--lease", metavar="OWNER", required=True,
+                   help="use --lease auto --lease-scope DIR to release this session's lease")
+    scope_flag(p)
     p.add_argument("--shutdown", action="store_true",
                    help="if this is the last lease and `ensure --boot --lease` booted the "
                         "device, shut it down and wait; the lease is removed only after that")
     wait_flag(p)
+    p = add("whoami", "show the current anchor on stderr and the session token on stdout")
+    p.add_argument("name")
+    scope_flag(p, required=True)
     add("list", "archives in the vault (bad or AppleDouble files are skipped and reported)")
     p = add("gc", "delete what interrupted runs left: half-restored devices, staging sets, "
                   "stale .partial files; list unpaired archives and old leases")
@@ -2489,6 +2687,8 @@ def history_record(argv, args, rc, kind, run_outcome=None):
               "bytes": fields.get("bytes"), "posterMB": fields.get("posterMB"), "cwd": cwd,
               "pid": os.getpid(), "seconds": round(time.monotonic() - RUN["started"], 3),
               "phases": phases}
+    if "leaseKind" in fields:
+        record["leaseKind"] = fields["leaseKind"]
     if run_outcome is not None:
         record.update(run_outcome, lockWait=phases.get("lockWait", 0), child=phases.get("child"))
         if "signal" in fields:
@@ -2504,6 +2704,7 @@ def main():
     run_outcome = None
     command = []
     if is_run:
+        note(leaseKind="held")
         run_outcome = {"stage": "acquire", "childRc": None, "teardown": "-"}
         if "--" in argv:
             boundary = argv.index("--")
@@ -2526,24 +2727,38 @@ def main():
         if getattr(args, "allow_lease", None) and not args.deny_other_leases:
             raise Fail("--allow-lease needs --deny-other-leases", EXIT_USAGE, "usage",
                        "add --deny-other-leases, or drop --allow-lease")
+        scope = getattr(args, "lease_scope", None)
+        prefix = getattr(args, "lease_prefix", None)
+        session = None
+        if scope is not None or prefix is not None:
+            if args.command != "whoami" and (args.lease != "auto" or scope is None):
+                raise Fail("--lease-scope and --lease-prefix are for auto leases", EXIT_USAGE,
+                           "usage", "use --lease auto --lease-scope DIR")
+            session = {"scope": os.path.realpath(scope), "anchor": session_anchor()}
         if args.command == "status":
             result = status(args.name)
             if not as_json:
                 if result["udid"]:
                     print(result["udid"])
                 for lease in result["leases"]:
-                    holders = (f" holderPids={lease['holderPids']}" if lease["kind"] == "held"
-                               else "")
+                    details = ""
+                    if lease["kind"] == "held":
+                        details = f" holderPids={lease['holderPids']}"
+                    elif lease["kind"] == "session":
+                        details = f" anchorAlive={lease['anchorAlive']} scopeExists={lease['scopeExists']}"
                     log(f"lease {lease['owner']}: {lease['kind']} alive={lease['alive']} "
                         f"ageSeconds={lease['ageSeconds']} overdue={lease['overdue']} "
-                        f"stale={lease['stale']}{holders}")
+                        f"stale={lease['stale']}{details}")
                     if lease.get("unreadable"):
                         log(f"warning: unreadable held lease {lease['owner']}: {lease['unreadable']}")
                     elif lease.get("holderHint"):
                         log(lease["holderHint"])
         elif args.command == "ensure":
             result = ensure(args.name, args.create, args.boot, args.lease, args.exclusive,
-                            args.wait, args.deny_other_leases, args.allow_lease)
+                            args.wait, args.deny_other_leases, args.allow_lease,
+                            session=session, lease_prefix=prefix)
+            if session is not None:
+                write_stderr(f"lease: {result['lease']}")
             if not as_json:
                 print(result["udid"])
         elif args.command == "run":
@@ -2559,7 +2774,13 @@ def main():
         elif args.command == "shutdown":
             result = shutdown_command(args.name, args.wait, args.busy_lock)
         elif args.command == "release":
-            result = release(args.name, args.lease, args.shutdown, args.wait)
+            result = release(args.name, args.lease, args.shutdown, args.wait, session=session)
+        elif args.command == "whoami":
+            result = whoami(args.name, **session)
+            if not as_json:
+                write_stderr(f"anchor: {json.dumps(result['anchor'])}")
+                if result["lease"] is not None:
+                    print(result["lease"])
         elif args.command == "list":
             result = list_archives()
             if not as_json:

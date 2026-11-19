@@ -45,6 +45,7 @@ second release on; v3.1.0 is the first.
 | `restore` | Restore an archived simulator and print its UDID |
 | `park`    | Archive a simulator to the vault, verify the read-back, then delete the local device |
 | `release` | Give up a lease taken by `ensure --lease` (optionally shut down) |
+| `whoami`  | Show the current anchor and matching session lease for a worktree |
 | `shutdown`| Shut a device down under its lock |
 | `status`  | Show the local device, archive and leases for a name |
 | `list`    | List archives in the vault |
@@ -53,6 +54,22 @@ second release on; v3.1.0 is the first.
 Commands other than `run` take `--json`. `sim-vault --help` is the reference for subcommands, flags,
 environment variables (`SIM_VAULT_DIR`, `SIM_VAULT_HISTORY`) and the exit-code table that
 tells a caller what to do next; `sim-vault <command> --help` has the per-command flags.
+
+### Manual sessions
+
+From the same session and worktree, acquire the simulator, do your work, and release it.
+
+```sh
+sim-vault ensure "My Test Device" --boot --lease auto --lease-scope "$PWD"
+# Work with the simulator.
+sim-vault release "My Test Device" --lease auto --lease-scope "$PWD" --shutdown
+```
+
+`ensure` prints the UDID on stdout and the lease token on stderr. Use
+`whoami "My Test Device" --lease-scope "$PWD"` to look up the token. A session
+lease stays until you release it. If your session was resumed under a new process,
+release the previous token with `release --lease <token>`. For non-interactive SSH,
+pass an explicit `--lease <owner>` to both `ensure` and `release`.
 
 ### Run a command with a held lease
 

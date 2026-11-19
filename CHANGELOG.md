@@ -1,11 +1,19 @@
 # Changelog
 
-## Unreleased
+## 4.0.0
 
+- Held leases use a process-held lock to protect a simulator across commands. A live
+  lock still protects the device if an older `release` removes the lease's JSON.
+- `run` acquires a held lease for a command and reports the command and teardown results.
+- Manual sessions can use `ensure --lease auto` and `release --lease auto` with
+  `--lease-scope`. `whoami` looks up the current session's token. Status shows session
+  lease age and anchor liveness, and history records the lease kind.
 - Newly created vault directories use mode `0700`, and newly created vault files (`.tar`,
   `.json` and their `.partial` files) are opened with mode `0600` from the start. Existing
   vault directories and archives, as well as state files under
   `~/Library/Developer/CoreSimulator/sim-vault/`, keep their current permissions.
+- Known issue [#1](https://github.com/audichuang/sim-vault/issues/1). A signal during
+  a `run` hand-off can leave a simulator booted or affect child signal forwarding and exit reporting.
 
 ## 3.1.0
 
