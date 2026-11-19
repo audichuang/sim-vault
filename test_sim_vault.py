@@ -1002,12 +1002,12 @@ class T2SharedLayer(SimVaultCase):
         os.makedirs(store)
         with open(os.path.join(store, "big"), "wb") as h:
             h.write(os.urandom(1024 * 1024) * 1025)          # real bytes, not sparse
-        rc, d = self.js("park", "SVTEST a", "--shutdown")
+        rc, d = self.js("park", "SVTEST a", "--shutdown", "--keep-posterboard")
         self.assertEqual((rc, d["kind"]), (9, "posterboard-bloated"))
         self.assertEqual(self.state(udid), "Booted")         # not shut down or deleted
-        self.assertIn("--trim-posterboard", d["next"])
+        self.assertIn("--keep-posterboard", d["next"])
         os.truncate(os.path.join(store, "big"), 900 * 1024 * 1024)
-        rc, d = self.js("park", "SVTEST a", "--shutdown")
+        rc, d = self.js("park", "SVTEST a", "--shutdown", "--keep-posterboard")
         self.assertEqual((rc, d["posterMB"]), (0, 900))
 
     def test_busy_lock_probe_and_hold(self):                    # Codex 1
@@ -1620,7 +1620,8 @@ class T4V3(SimVaultCase):
         udid = self.create("SVTEST poster")
         self.put(udid, "data/Library/Application Support/PRBPosterExtensionDataStore/x",
                  200 * 1024)
-        self.assertEqual(self.js("park", "SVTEST poster", SV_TEST_POSTER_LIMIT_KB=64)[0], 9)
+        self.assertEqual(self.js("park", "SVTEST poster", "--keep-posterboard",
+                                 SV_TEST_POSTER_LIMIT_KB=64)[0], 9)
         good_vault = self.vault
         self.vault = os.path.join(self.base, "unmounted", "vault")
         self.assertEqual(self.js("park", "SVTEST lease")[0], 5)
@@ -1713,7 +1714,7 @@ class T4V3(SimVaultCase):
         udid = self.create("SVTEST a")
         self.put(udid, "data/Library/Application Support/PRBPosterExtensionDataStore/big",
                  200 * 1024)
-        rc, d = self.js("park", "SVTEST a", "--trim-posterboard", "--exclude-symbol-cache",
+        rc, d = self.js("park", "SVTEST a", "--exclude-symbol-cache",
                         SV_TEST_POSTER_LIMIT_KB=64)
         self.assertEqual(rc, 0, d)
         self.assertEqual(self.meta("SVTEST a")["excluded"],
@@ -1731,14 +1732,16 @@ class T4V3(SimVaultCase):
         self.put(udid, app + "com.apple.PosterKit/app")
         return udid
 
-    def test_trim_posterboard_over_limit(self):
+    def test_trim_posterboard_over_limit_by_default(self):
         udid = self.poster_device()
-        rc, d = self.js("park", "SVTEST a", "--shutdown", SV_TEST_POSTER_LIMIT_KB=64)
-        self.assertEqual(rc, 9)
-        self.assertEqual(self.state(udid), "Booted")
-        rc, d = self.js("park", "SVTEST a", "--shutdown", "--trim-posterboard",
+        rc, d = self.js("park", "SVTEST a", "--shutdown", "--keep-posterboard",
                         SV_TEST_POSTER_LIMIT_KB=64)
-        self.assertEqual(rc, 0, d)
+        self.assertEqual((rc, d["kind"]), (9, "posterboard-bloated"))
+        self.assertEqual(self.state(udid), "Booted")
+        r = self.sv("park", "SVTEST a", "--shutdown", "--json", SV_TEST_POSTER_LIMIT_KB=64)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = json.loads(r.stdout)
+        self.assertIn("leaving it out of the archive", r.stderr)
         meta = self.meta("SVTEST a")
         excluded = ["data/Library/Application Support/PRBPosterExtensionDataStore",
                     "data/Library/Application Support/com.apple.PosterKit"]
@@ -1756,9 +1759,14 @@ class T4V3(SimVaultCase):
         r = self.sv("restore", "SVTEST a")
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    def test_trim_posterboard_alias_still_accepted(self):
+        udid = self.poster_device(state="Shutdown")
+        rc, d = self.js("park", "SVTEST a", "--trim-posterboard", SV_TEST_POSTER_LIMIT_KB=64)
+        self.assertEqual((rc, d["posterboardTrimmed"]), (0, True))
+
     def test_trim_posterboard_under_limit_archives_everything(self):
         udid = self.poster_device(state="Shutdown")
-        rc, d = self.js("park", "SVTEST a", "--trim-posterboard")
+        rc, d = self.js("park", "SVTEST a")
         self.assertEqual(rc, 0, d)
         self.assertNotIn("posterboardTrimmed", self.meta("SVTEST a"))
         self.assertNotIn("excluded", self.meta("SVTEST a"))

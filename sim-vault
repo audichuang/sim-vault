@@ -17,7 +17,8 @@ commands (see `sim-vault <command> --help` for flags):
   restore <name>   `ensure` without policy, for people and old scripts: never creates or
                    boots, ignores leases; prints the UDID. Callers using leases use ensure
   park <name>      archive, verify, then delete the device (refuses while it is in use);
-                   --trim-posterboard, --exclude-symbol-cache leave system data out
+                   PosterBoard data over 1 GiB is left out by default (--keep-posterboard:
+                   exit 9 instead); --exclude-symbol-cache leaves another system cache out
   shutdown <name>  shut the device down under the lock unless a lease is held (8); for
                    project `down` scripts, after releasing their own lease
   release <name>   drop a lease; with --shutdown the last lease shuts down what ensure booted
@@ -62,9 +63,11 @@ exit codes and what the caller does next:
      120 s after shutdown, or the device was booted or written while being archived
      (nothing deleted). The message names the holder; wait for it, or release it if it is
      stale. If the same holder returns 8 twice, stop and report it
-  9  park: PosterBoard data is over 1 GiB; the device was not shut down or deleted; pass
-     --trim-posterboard to archive without the PosterBoard store, or rebuild it
-     (modern-ios-guidance, PosterBoard) and park again
+  9  park --keep-posterboard: PosterBoard data is over 1 GiB; the device was not shut
+     down or deleted; park without --keep-posterboard to archive without the PosterBoard
+     store, or rebuild it (modern-ios-guidance, PosterBoard) and park again. Without the
+     flag park leaves that data out instead (the system rebuilds it on the first boot
+     after a restore)
   10 restore/ensure: the local device with this name is not the archived one, and the
      archive can still be restored: stop and report; do not delete or park on your own
 """
@@ -99,7 +102,7 @@ HISTORY_COMMANDS = ("ensure", "restore", "park", "release", "shutdown")
 HISTORY_LOCK_TIMEOUT = 5
 POSTER_STORE = os.path.join("data", "Library", "Application Support",
                             "PRBPosterExtensionDataStore")
-# What `park --trim-posterboard` leaves out, relative to the device directory: the store
+# What park leaves out when PosterBoard data is over the limit (unless --keep-posterboard), relative to the device directory: the store
 # measured above and its sibling the PosterBoard repair (SIM2) also renames away.
 POSTER_TRIM = ("data/Library/Application Support/PRBPosterExtensionDataStore",
                "data/Library/Application Support/com.apple.PosterKit")
@@ -924,7 +927,7 @@ def settle_pending(tar_path, meta_path):
 # -- park ------------------------------------------------------------------------------
 
 def park(name, shutdown=False, replace=False, wait=DEFAULT_WAIT, busy_locks=(),
-         missing_ok=False, trim_posterboard=False, exclude_symbol_cache=False):
+         missing_ok=False, keep_posterboard=False, exclude_symbol_cache=False):
     vault = vault_dir()
     tar_path, meta_path = archive_paths(vault, name)
     with DeviceLock(name, wait):
@@ -952,14 +955,14 @@ def park(name, shutdown=False, replace=False, wait=DEFAULT_WAIT, busy_locks=(),
         held = hold_busy_locks(busy_locks, udid)
         try:
             result = park_locked(name, device, tar_path, meta_path, shutdown, replace,
-                                 trim_posterboard, exclude_symbol_cache)
+                                 keep_posterboard, exclude_symbol_cache)
         finally:
             release_fds(held)
         remove_file(boot_record_path(name))
         return result
 
 
-def park_locked(name, device, tar_path, meta_path, shutdown, replace, trim_posterboard=False,
+def park_locked(name, device, tar_path, meta_path, shutdown, replace, keep_posterboard=False,
                 exclude_symbol_cache=False):
     udid = device["udid"]
     old = read_meta(meta_path)
@@ -978,15 +981,17 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace, trim_poste
     log(f"PosterBoard data: {poster // 1024} MB")
     excluded = []
     if poster > POSTER_LIMIT_KB:
-        if not trim_posterboard:
+        if keep_posterboard:
             raise Fail(f"PosterBoard data of '{name}' is {poster // 1024} MB (limit "
-                       f"{POSTER_LIMIT_KB // 1024} MB); it would go into the archive and come "
-                       "back on every restore", EXIT_POSTER, "posterboard-bloated",
-                       "the device was not shut down or deleted; pass --trim-posterboard to "
-                       "archive without the PosterBoard store, or rebuild it "
-                       "(modern-ios-guidance, PosterBoard section) and park again")
-        log(f"PosterBoard data is over {POSTER_LIMIT_KB // 1024} MB: leaving it out of the "
-            "archive (the device itself keeps it until it is deleted)")
+                       f"{POSTER_LIMIT_KB // 1024} MB); with --keep-posterboard it would go "
+                       "into the archive and come back on every restore", EXIT_POSTER,
+                       "posterboard-bloated",
+                       "the device was not shut down or deleted; park without "
+                       "--keep-posterboard to archive without the PosterBoard store, or "
+                       "rebuild it (modern-ios-guidance, PosterBoard section) and park again")
+        log(f"PosterBoard data is {poster // 1024} MB, over {POSTER_LIMIT_KB // 1024} MB: "
+            "leaving it out of the archive; the system rebuilds it on the first boot after a "
+            "restore (pass --keep-posterboard to refuse with 9 instead)")
         excluded += [rel for rel in POSTER_TRIM
                      if os.path.isdir(os.path.join(DEFAULT_SET, udid, rel))]
     if exclude_symbol_cache and os.path.isdir(os.path.join(DEFAULT_SET, udid, SYMBOL_CACHE)):
@@ -1802,12 +1807,16 @@ def build_parser():
                         "without waiting (held: exit 8) and kept until park ends. Repeatable")
     p.add_argument("--missing-ok", action="store_true",
                    help="exit 0 when there is no such device")
-    p.add_argument("--trim-posterboard", action="store_true",
-                   help="when the PosterBoard data is over the 1 GiB limit (else exit 9), "
-                        "archive without data/Library/Application Support/"
+    p.add_argument("--keep-posterboard", action="store_true",
+                   help="by default, PosterBoard data over the 1 GiB limit is left out of the "
+                        "archive (data/Library/Application Support/"
                         "{PRBPosterExtensionDataStore,com.apple.PosterKit}; the system "
-                        "rebuilds them after a restore (wallpaper and lock screen may reset). "
-                        "Under the limit the archive is complete as usual")
+                        "rebuilds them on the first boot after a restore, wallpaper and lock "
+                        "screen may reset). With this flag park refuses with exit 9 instead, "
+                        "touching nothing. Under the limit the archive is always complete")
+    p.add_argument("--trim-posterboard", action="store_true",
+                   help="no-op, kept for older callers: leaving bloated PosterBoard data out "
+                        "is now the default")
     p.add_argument("--exclude-symbol-cache", action="store_true",
                    help="leave the system's data/Library/Caches/com.apple.coresymbolicationd "
                         "out of the archive (can be GBs; apps' own Caches are kept)")
@@ -1929,7 +1938,7 @@ def main():
                 print(result["udid"])
         elif args.command == "park":
             result = park(args.name, args.shutdown, args.replace, args.wait, args.busy_lock,
-                          args.missing_ok, args.trim_posterboard, args.exclude_symbol_cache)
+                          args.missing_ok, args.keep_posterboard, args.exclude_symbol_cache)
         elif args.command == "shutdown":
             result = shutdown_command(args.name, args.wait, args.busy_lock)
         elif args.command == "release":
