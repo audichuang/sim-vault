@@ -21,7 +21,8 @@ import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.environ.get("SV_TEST_SCRIPT_UNDER_TEST") or os.path.join(HERE, "sim-vault")
+SCRIPT = (os.environ.get("SV_TEST_SCRIPT_UNDER_TEST")
+          or os.path.join(HERE, "..", "src", "sim_vault", "__init__.py"))
 RT = "com.apple.CoreSimulator.SimRuntime.iOS-27-2"
 RT_OLD = "com.apple.CoreSimulator.SimRuntime.iOS-26-0"
 PY = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
