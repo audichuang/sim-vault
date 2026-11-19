@@ -8,6 +8,8 @@
 - Manual sessions can use `ensure --lease auto` and `release --lease auto` with
   `--lease-scope`. `whoami` looks up the current session's token. Status shows session
   lease age and anchor liveness, and history records the lease kind.
+  If the process list cannot be read, `ensure --lease auto` fails instead of guessing the
+  session, and `release`/`whoami --lease auto` report `no-lease` and leave the lease in place.
 - Newly created vault directories use mode `0700`, and newly created vault files (`.tar`,
   `.json` and their `.partial` files) are opened with mode `0600` from the start. Existing
   vault directories and archives, as well as state files under
