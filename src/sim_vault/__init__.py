@@ -37,7 +37,8 @@ silently filling the local disk. Locks, leases and staging live in
 ~/Library/Developer/CoreSimulator/sim-vault/ (fixed paths, not $TMPDIR). Every ensure,
 restore, park, release and shutdown appends one JSON line (ts, cmd, name, udid, rc, kind,
 action, bytes, posterMB, cwd, pid, seconds, phases) to history.jsonl there, also on failure
-and on SIGTERM/SIGHUP/SIGINT; a history that cannot be written only warns.
+and on SIGTERM/SIGHUP/SIGINT; a history that cannot be written only warns. $SIM_VAULT_HISTORY
+overrides the path of history.jsonl (default: that directory).
 
 exit codes and what the caller does next:
   0  ok
@@ -86,6 +87,7 @@ import sys
 import tempfile
 import time
 
+__version__ = "3.1.0"
 TOOL_VERSION = "3"
 DEFAULT_VAULT = "/Volumes/WorkSpace/ios-sim"
 SIM_ROOT = os.path.expanduser("~/Library/Developer/CoreSimulator")
@@ -97,7 +99,8 @@ LEASE_DIR = os.path.join(STATE_ROOT, "leases")
 RECORD_DIR = os.path.join(STATE_ROOT, "archives")
 STAGING_ROOT = os.path.join(STATE_ROOT, "staging")
 LEGACY_STAGING_ROOT = os.path.join(SIM_ROOT, "sim-vault-staging")
-HISTORY_PATH = os.path.join(STATE_ROOT, "history.jsonl")
+HISTORY_PATH = (os.environ.get("SIM_VAULT_HISTORY")
+                or os.path.join(STATE_ROOT, "history.jsonl"))
 HISTORY_COMMANDS = ("ensure", "restore", "park", "release", "shutdown")
 HISTORY_LOCK_TIMEOUT = 5
 POSTER_STORE = os.path.join("data", "Library", "Application Support",
@@ -1753,6 +1756,7 @@ class Parser(argparse.ArgumentParser):
 def build_parser():
     parser = Parser(prog="sim-vault", description=__doc__,
                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"sim-vault {__version__}")
     sub = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
 
     def add(name, text):
@@ -1857,7 +1861,7 @@ def write_history(record):
     runs whole. A failure only warns: the exit code and stdout stay as they are."""
     try:
         line = (json.dumps(record, ensure_ascii=False) + "\n").encode()
-        os.makedirs(STATE_ROOT, exist_ok=True)
+        os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
         fd = os.open(HISTORY_PATH, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
             # Bounded: a stopped process holding this lock must not keep the caller from
