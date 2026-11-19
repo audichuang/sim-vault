@@ -60,6 +60,8 @@ holds the archive directory (ACL) so that only your own account can read it. sim
 creates new vault directories with mode `0700` and new archive files (`.tar`, `.json` and
 their `.partial` files) with mode `0600`; existing vault directories and archives are not
 changed (`chmod` them yourself if needed).
+On an SMB share (`smbfs`) the modes shown by macOS are synthesized by the client and the
+server's ACL is what actually controls access, so set the ACL there.
 
 ## Tests
 
