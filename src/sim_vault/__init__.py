@@ -66,7 +66,7 @@ exit codes and what the caller does next:
      stale. If the same holder returns 8 twice, stop and report it
   9  park --keep-posterboard: PosterBoard data is over 1 GiB; the device was not shut
      down or deleted; park without --keep-posterboard to archive without the PosterBoard
-     store, or rebuild it (modern-ios-guidance, PosterBoard) and park again. Without the
+     store, or rebuild the PosterBoard store and park again. Without the
      flag park leaves that data out instead (the system rebuilds it on the first boot
      after a restore)
   10 restore/ensure: the local device with this name is not the archived one, and the
@@ -106,7 +106,7 @@ HISTORY_LOCK_TIMEOUT = 5
 POSTER_STORE = os.path.join("data", "Library", "Application Support",
                             "PRBPosterExtensionDataStore")
 # What park leaves out when PosterBoard data is over the limit (unless --keep-posterboard), relative to the device directory: the store
-# measured above and its sibling the PosterBoard repair (SIM2) also renames away.
+# measured above and its sibling the PosterBoard repair also renames away.
 POSTER_TRIM = ("data/Library/Application Support/PRBPosterExtensionDataStore",
                "data/Library/Application Support/com.apple.PosterKit")
 SYMBOL_CACHE = "data/Library/Caches/com.apple.coresymbolicationd"
@@ -991,7 +991,7 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace, keep_poste
                        "posterboard-bloated",
                        "the device was not shut down or deleted; park without "
                        "--keep-posterboard to archive without the PosterBoard store, or "
-                       "rebuild it (modern-ios-guidance, PosterBoard section) and park again")
+                       "rebuild the PosterBoard store and park again")
         log(f"PosterBoard data is {poster // 1024} MB, over {POSTER_LIMIT_KB // 1024} MB: "
             "leaving it out of the archive; the system rebuilds it on the first boot after a "
             "restore (pass --keep-posterboard to refuse with 9 instead)")

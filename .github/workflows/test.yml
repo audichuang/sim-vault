@@ -15,10 +15,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: py
         with:
           python-version: ${{ matrix.python-version }}
       - name: Unit tests
-        run: python -m unittest discover -s tests -v
+        env:
+          SV_TEST_PY: ${{ steps.py.outputs.python-path }}
+        run: |
+          "$SV_TEST_PY" -V
+          "$SV_TEST_PY" -m unittest discover -s tests -v
       - name: Install and smoke test
         run: |
           python -m venv "$RUNNER_TEMP/venv"

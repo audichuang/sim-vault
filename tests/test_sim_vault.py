@@ -1,6 +1,6 @@
 """sim-vault tests against a fake `xcrun simctl` and a vault under /tmp.
 
-Run: python3 -m unittest modern-ios-guidance/scripts/test_sim_vault.py (or pytest).
+Run: python3 -m unittest discover -s tests (SV_TEST_PY picks the interpreter of the subprocesses).
 Nothing here touches real simulators: every run gets its own HOME under /tmp, the stub
 directory first on PATH, and a loader that refuses to start unless `xcrun` resolves to
 the stub. The loader also stubs the same-volume check (both /tmp and CoreSimulator live
@@ -25,7 +25,8 @@ SCRIPT = (os.environ.get("SV_TEST_SCRIPT_UNDER_TEST")
           or os.path.join(HERE, "..", "src", "sim_vault", "__init__.py"))
 RT = "com.apple.CoreSimulator.SimRuntime.iOS-27-2"
 RT_OLD = "com.apple.CoreSimulator.SimRuntime.iOS-26-0"
-PY = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
+PY = os.environ.get("SV_TEST_PY") or (
+    "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable)
 
 FAKE_XCRUN = r'''#!/usr/bin/env python3
 import fcntl, json, os, plistlib, shutil, sys, time, uuid
