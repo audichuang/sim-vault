@@ -174,6 +174,22 @@ with open(sys.argv[1], "a") as lock:
         self.assertEqual(json.loads(self.boot_record.read_text())["by"], ["remaining"])
         self.assert_no_shutdown()
 
+    def test_restore_reaps_boot_record_after_manual_shutdown(self):
+        udid = self.create(NAME)
+        self.assertEqual(self.js("ensure", NAME, "--boot", "--lease", OWNER)[0], 0)
+        with self.holder(udid, mode="shared"):
+            self.assertEqual(self.js("ensure", NAME, "--lease", "remaining")[0], 0)
+        self.xcrun("shutdown", udid)
+        self.assertEqual(self.js("restore", NAME)[0], 0)
+        record_after_reap = self.js("status", NAME)[1]["bootedByLease"]
+        self.xcrun("boot", udid)
+        rc, result = self.js("release", NAME, "--lease", "remaining", "--shutdown")
+        self.assertEqual((rc, result.get("shutdown"), self.state(udid)), (0, False, "Booted"))
+        self.assertIsNone(record_after_reap)
+        self.assertFalse(self.lease_file.exists())
+        self.assertFalse(self.lock_file.exists())
+        self.assertEqual(self.count("shutdown"), 1)  # Only the manual shutdown.
+
     def test_status_preserves_old_fields_and_reports_liveness(self):
         udid = self.create(NAME)
         baseline = self.js("status", NAME)[1]
@@ -450,6 +466,18 @@ with open(sys.argv[1], "a") as lock:
             self.assertTrue(self.lease_file.exists())
             self.assertEqual(json.loads(self.boot_record.read_text())["by"], [OWNER])
             self.assertEqual(self.state(udid), "Booted")
+        self.assert_no_shutdown()
+
+    def test_release_removes_boot_record_when_only_an_orphan_lock_remains(self):
+        udid = self.create(NAME)
+        self.assertEqual(self.js("ensure", NAME, "--boot", "--lease", "manual")[0], 0)
+        with self.holder(udid, metadata=False):
+            rc, result = self.js("release", NAME, "--lease", "manual", "--shutdown")
+            self.assertEqual((rc, result.get("action"), result.get("shutdown")),
+                             (0, "released", False), result)
+            self.assertIsNone(self.js("status", NAME)[1]["bootedByLease"])
+            self.assertFalse(self.boot_record.exists())
+            self.assertTrue(self.lock_file.exists())
         self.assert_no_shutdown()
 
     def test_gc_reaps_absent_devices_by_key_under_device_lock(self):

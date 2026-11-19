@@ -910,9 +910,12 @@ def release_boot_record(path, record, owners, remaining):
         remove_file(path)
     elif any(owner in owners for owner in record.get("by", [])):
         # A rename can leave leases for two devices in the same directory.
-        record["by"] = [l["owner"] for l in remaining
-                        if l.get("udid") == record.get("udid") and l.get("owner") is not None]
-        write_json(path, record)
+        next_owners = [l["owner"] for l in remaining
+                       if l.get("udid") == record.get("udid") and l.get("owner") is not None]
+        if next_owners:
+            write_json(path, dict(record, by=next_owners))
+        else:
+            remove_file(path)
 
 
 def reap_boot_record(directory, leases, live, dead):
@@ -921,8 +924,8 @@ def reap_boot_record(directory, leases, live, dead):
     if not record:
         return
     udid = record.get("udid")
-    present = {d["udid"] for d in all_devices()}
-    if udid not in present:
+    states = {d["udid"]: d["state"] for d in all_devices()}
+    if states.get(udid) in (None, "Shutdown"):
         remove_file(path)
         return
     owners = {lease["owner"] for lease in dead if lease.get("udid") == udid and "owner" in lease}
@@ -931,7 +934,7 @@ def reap_boot_record(directory, leases, live, dead):
     owners.update(o for o in record.get("by", [])
                   if held_lock_path(lease_filename(o)) in orphan_locks)
     if owners:
-        remaining = live + [l for l in leases if l.get("kind") != "held" and l.get("udid") in present]
+        remaining = live + [l for l in leases if l.get("kind") != "held" and l.get("udid") in states]
         release_boot_record(path, record, owners, remaining)
 
 
