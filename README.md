@@ -70,6 +70,9 @@ sim-vault release "My Test Device" --lease auto --lease-scope "$PWD" --shutdown
 lease stays until you release it. If your session was resumed under a new process,
 release the previous token with `release --lease <token>`. For non-interactive SSH,
 pass an explicit `--lease <owner>` to both `ensure` and `release`.
+When sim-vault cannot identify the session (no Claude Code, Codex, login, sshd or tmux
+ancestor, e.g. a launchd or cron job), `ensure --lease auto` exits 2 and `whoami` and
+`release --lease auto` find no lease; use an explicit `--lease <owner>` there too.
 
 ### Run a command with a held lease
 

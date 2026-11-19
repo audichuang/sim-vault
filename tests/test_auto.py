@@ -206,36 +206,61 @@ class SessionLeaseTests(SessionLeaseCase):
                                                  CLAUDE_CODE_SESSION_ID="claude-a"))["lease"],
                          previous)
 
-    def test_null_anchor_matches_only_another_null_anchor(self):
+    def null_anchor_lease(self, anchor, scope=None):
+        """A 4.0.0-style session lease whose anchor was never identified."""
+        token = self.acquire(anchor, scope=scope)["lease"]
+        path = self.lease_file(token)
+        record = json.loads(path.read_text())
+        record["anchor"] = None
+        path.write_text(json.dumps(record))
+        return token, path
+
+    def test_null_anchor_never_matches_a_lease(self):
         self.create(NAME)
-        anchor = self.set_anchor()
-        token = self.acquire(anchor)["lease"]
         no_ancestors = self.ps_snapshot()
-        scope = ("--lease-scope", str(self.scope))
-        found = self.result(self.helper_cli(no_ancestors, "whoami", NAME, *scope, "--json"))
-        self.assertEqual((found["anchor"], found["lease"]), (None, None))
-        released = self.result(self.helper_cli(no_ancestors, "release", NAME, "--lease", "auto",
-                                               *scope, "--json"))
-        self.assertEqual((released["action"], released["lease"]), ("no-lease", None))
-        self.assertTrue(self.lease_file(token).exists())
-        self.result(self.sv("release", NAME, "--lease", token, "--json"))
-        acquired = self.result(self.helper_cli(no_ancestors, "ensure", NAME, "--lease", "auto",
-                                               *scope, "--json"))
-        token = acquired["lease"]
-        self.assertIsNone(json.loads(self.lease_file(token).read_text())["anchor"])
+        upper = self.scope.with_name("WorkTree-Null")
+        upper.mkdir()
+        lower = self.scope.with_name("worktree-null")
+        scopes = [str(self.scope)] + ([str(lower)] if lower.is_dir() else [])
+        anchor = self.set_anchor()
+        token, path = self.null_anchor_lease(anchor)
+        alias_token, alias_path = self.null_anchor_lease(anchor, scope=upper)
+        cases = [(str(self.scope), path)] + [(scope, alias_path) for scope in scopes[1:]]
+        for scope, lease in cases:
+            with self.subTest(scope=scope):
+                options = ("--lease-scope", scope, "--json")
+                found = self.result(self.helper_cli(no_ancestors, "whoami", NAME, *options))
+                self.assertEqual((found["anchor"], found["lease"]), (None, None))
+                released = self.result(self.helper_cli(no_ancestors, "release", NAME, "--lease",
+                                                       "auto", *options))
+                self.assertEqual((released["action"], released["lease"]), ("no-lease", None))
+                self.assertTrue(lease.exists())
         self.assertIsNone(self.whoami(anchor)["lease"])
-        self.assertEqual(self.result(self.helper_cli(no_ancestors, "whoami", NAME, *scope,
-                                                    "--json"))["lease"], token)
-        released = self.result(self.helper_cli(no_ancestors, "release", NAME, "--lease", "auto",
-                                               *scope, "--json"))
-        self.assertEqual((released["action"], released["lease"]), ("released", token))
+        for leftover in (token, alias_token):
+            self.result(self.sv("release", NAME, "--lease", leftover, "--json"))
+        self.assertFalse(path.exists() or alias_path.exists())
+
+    def test_ensure_auto_refuses_an_unidentified_session(self):
+        self.create(NAME)
+        no_ancestors = self.ps_snapshot()
+        failed = self.result(self.helper_cli(no_ancestors, "ensure", NAME, "--lease", "auto",
+                                             "--lease-scope", str(self.scope), "--json"), 2)
+        self.assertEqual(failed["kind"], "no-session-anchor")
+        self.assertIn("--lease OWNER", failed["next"])
+        self.assertEqual(list(self.state_root.glob("leases/*/*.json")), [])
+        explicit = self.result(self.helper_cli(no_ancestors, "ensure", NAME, "--lease", "cron",
+                                               "--json"))
+        self.assertEqual(explicit["lease"], "cron")
+        records = [json.loads(line) for line in
+                   (self.state_root / "history.jsonl").read_text().splitlines()]
+        self.assertEqual([(r["cmd"], r["rc"], r.get("leaseKind")) for r in records],
+                         [("ensure", 2, "session"), ("ensure", 0, "legacy")])
 
     def test_failed_process_inspection_never_creates_or_resolves_a_lease(self):
         udid = self.create(NAME)
-        no_ancestors = self.ps_snapshot()
         scope = ("--lease-scope", str(self.scope))
         options = (NAME, "--lease", "auto", *scope, "--json")
-        token = self.result(self.helper_cli(no_ancestors, "ensure", *options, "--boot"))["lease"]
+        token = self.acquire(self.set_anchor(), "--boot")["lease"]
         path = self.lease_file(token)
         original = path.read_bytes()
         bad_ps = """
@@ -505,7 +530,7 @@ class SessionLeaseTests(SessionLeaseCase):
 
     def test_help_and_release_notes_cover_manual_sessions(self):
         version = self.sv("--version")
-        self.assertEqual((version.returncode, version.stdout), (0, "sim-vault 4.0.0\n"))
+        self.assertEqual((version.returncode, version.stdout), (0, "sim-vault 4.1.0\n"))
         for args, labels in (
             ((), ("whoami", "--lease auto", "--lease-scope", "--lease-prefix")),
             (("ensure",), ("--lease-scope", "--lease-prefix")),

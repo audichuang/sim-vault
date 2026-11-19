@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.1.0
+
+- A caller whose session cannot be identified (null anchor, e.g. a launchd or cron job)
+  no longer matches any session lease, including another null-anchor lease. Before, two
+  such callers in the same scope, or in scopes differing only by case, were treated as the
+  same session and could release each other's lease.
+- `ensure --lease auto` without an identifiable session now exits 2 (`no-session-anchor`)
+  instead of creating a lease; pass an explicit `--lease <owner>`. `whoami` and
+  `release --lease auto` report no lease for such a caller.
+- Session leases with a null anchor left by 4.0.0 can only be released with
+  `release --lease <token>` (the token is in `status`).
+
 ## 4.0.0
 
 - Held leases use a process-held lock to protect a simulator across commands. A live

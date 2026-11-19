@@ -13,7 +13,7 @@ class TestVersion(SimVaultCase):
     def test_version_flag(self):
         proc = self.sv("--version")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "sim-vault 4.0.0")
+        self.assertEqual(proc.stdout.strip(), "sim-vault 4.1.0")
 
     def test_version_flag_ignores_missing_subcommand(self):
         proc = self.sv("--version", "--json")

@@ -97,7 +97,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 TOOL_VERSION = "3"
 DEFAULT_VAULT = "/Volumes/WorkSpace/ios-sim"
 SIM_ROOT = os.path.expanduser("~/Library/Developer/CoreSimulator")
@@ -900,8 +900,10 @@ def session_anchor():
 
 
 def same_anchor(stored, caller):
+    # An unidentified session (null anchor) is nobody: two such callers, e.g. launchd jobs,
+    # must not share or release each other's lease.
     if stored is None or caller is None:
-        return stored is caller
+        return False
     if (stored["pid"] != caller["pid"] or stored["startedAt"] is None
             or stored["startSource"] != caller["startSource"]
             or stored["startedAt"] != caller["startedAt"]):
@@ -2815,6 +2817,12 @@ def main():
                 session = {"scope": normalized_scope, "anchor": session_anchor()}
             except ProcessInspectionFailed as exc:
                 inspection_error = str(exc)
+        if (args.command == "ensure" and session is not None and session["anchor"] is None
+                and not inspection_error):
+            note(leaseKind="session")
+            raise Fail("--lease auto cannot identify this session (no Claude Code, Codex, login, "
+                       "sshd or tmux ancestor)", EXIT_USAGE, "no-session-anchor",
+                       "use an explicit --lease OWNER")
         if inspection_error:
             if auto_lease:
                 note(leaseKind="session")
