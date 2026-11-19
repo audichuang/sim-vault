@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,13 +7,12 @@ name = "sim-vault"
 dynamic = ["version"]
 description = "Park iOS simulators as archives on another volume, restore them, with per-device locks and leases"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.9"
 dependencies = []
 classifiers = [
     "Operating System :: MacOS",
     "Environment :: Console",
-    "License :: OSI Approved :: MIT License",
 ]
 
 [project.scripts]
