@@ -2,9 +2,11 @@
 import json
 import os
 import re
+import subprocess
 import unittest
+from unittest import mock
 
-from test_sim_vault import SimVaultCase
+from test_sim_vault import PY, SimVaultCase
 
 
 class TestVersion(SimVaultCase):
@@ -34,17 +36,23 @@ class TestHistoryOverride(SimVaultCase):
         self.assertFalse(os.path.exists(self.default_history()))
 
     def test_bare_filename_writes_to_cwd(self):
-        proc = self.sv("shutdown", "SVTEST none", "--json", SIM_VAULT_HISTORY="h.jsonl")
+        cwd = os.path.join(self.base, "cwd")
+        os.makedirs(cwd)
+        proc = subprocess.run([PY, self.loader, "shutdown", "SVTEST none", "--json"],
+                              env=self.env(SIM_VAULT_HISTORY="h.jsonl"), cwd=cwd,
+                              capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("warning", proc.stderr)
-        # the subprocess inherits this process's cwd
-        path = os.path.join(os.getcwd(), "h.jsonl")
-        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
-        with open(path) as h:
+        with open(os.path.join(cwd, "h.jsonl")) as h:
             self.assertEqual([json.loads(line)["cmd"] for line in h], ["shutdown"])
 
     def test_outer_variable_does_not_leak_into_tests(self):
-        self.assertNotIn("SIM_VAULT_HISTORY", self.env())
+        outer = os.path.join(self.base, "outer.jsonl")
+        with mock.patch.dict(os.environ, {"SIM_VAULT_HISTORY": outer}):
+            self.assertNotIn("SIM_VAULT_HISTORY", self.env())
+            proc = self.sv("shutdown", "SVTEST none", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(os.path.exists(outer))
 
     def test_unset_keeps_default_path(self):
         proc = self.sv("shutdown", "SVTEST none", "--json")
