@@ -8,6 +8,7 @@ import select
 import shlex
 import subprocess
 import textwrap
+import unicodedata
 
 from test_sim_vault import HERE, PY, SimVaultCase
 
@@ -22,6 +23,12 @@ class SessionLeaseCase(SimVaultCase):
         self.scope = Path(self.base) / "worktree"
         self.scope.mkdir()
         self.state_root = Path(self.home) / "Library/Developer/CoreSimulator/sim-vault"
+
+    def env(self, **extra):
+        env = dict(CODEX_THREAD_ID="", CLAUDE_CODE_SESSION_ID="", CLAUDE_PID="",
+                   SIM_VAULT_ANCHOR_PID="")
+        env.update(extra)
+        return super().env(**env)
 
     def set_anchor(self):
         child = subprocess.Popen(["/bin/sleep", "60"])
@@ -43,16 +50,16 @@ class SessionLeaseCase(SimVaultCase):
         self.assertEqual(proc.returncode, rc, proc.stderr)
         return json.loads(proc.stdout)
 
-    def acquire(self, anchor, *args, scope=None):
-        proc = self.session("ensure", anchor, "--json", *args, scope=scope)
+    def acquire(self, anchor, *args, scope=None, **env):
+        proc = self.session("ensure", anchor, "--json", *args, scope=scope, **env)
         result = self.result(proc)
         self.assertIn(f"lease: {result['lease']}", proc.stderr.splitlines())
         return result
 
-    def whoami(self, anchor, scope=None):
+    def whoami(self, anchor, scope=None, **env):
         return self.result(self.sv("whoami", NAME, "--lease-scope",
                                    str(self.scope if scope is None else scope), "--json",
-                                   SIM_VAULT_ANCHOR_PID=anchor.pid))
+                                   SIM_VAULT_ANCHOR_PID=anchor.pid, **env))
 
     def lease_file(self, token):
         filename = hashlib.sha1(token.encode()).hexdigest() + ".json"
@@ -66,6 +73,18 @@ class SessionLeaseCase(SimVaultCase):
         loader.write_text(setup + textwrap.dedent(snippet) + "\nmod.main()\n" + entry)
         return subprocess.run([PY, str(loader), *args], env=self.env(**env),
                               capture_output=True, text=True, timeout=10)
+
+    def ps_snapshot(self, parent=1, rows=""):
+        return f"""
+        import subprocess
+        real_run = subprocess.run
+        def run(argv, **opts):
+            if argv[0] == "/bin/ps" and "-axww" in argv:
+                rows = f"{{os.getpid()}} {parent} python\\n" + {rows!r} + "1 0 /sbin/launchd\\n"
+                return subprocess.CompletedProcess(argv, 0, stdout=rows)
+            return real_run(argv, **opts)
+        subprocess.run = run
+        """
 
 
 class SessionLeaseTests(SessionLeaseCase):
@@ -142,37 +161,182 @@ class SessionLeaseTests(SessionLeaseCase):
         released = self.result(self.session("release", anchor, "--json"))
         self.assertEqual(released["lease"], token)
 
-    def test_null_anchor_uses_scope_only_for_whoami_and_release(self):
+    def test_codex_threads_on_one_process_have_separate_session_identity(self):
         self.create(NAME)
-        token = self.acquire(self.set_anchor())["lease"]
-        no_ancestors = """
+        anchor = self.set_anchor()
+        token = self.acquire(anchor, CODEX_THREAD_ID="thread-a")["lease"]
+        self.assertEqual(self.whoami(anchor, CODEX_THREAD_ID="thread-a")["lease"], token)
+        self.assertEqual(self.whoami(anchor, CODEX_THREAD_ID="thread-a")["anchor"]["session"],
+                         "thread-a")
+        for thread in ("thread-b", ""):
+            with self.subTest(thread=thread):
+                self.assertIsNone(self.whoami(anchor, CODEX_THREAD_ID=thread)["lease"])
+                release = self.result(self.session("release", anchor, "--shutdown", "--json",
+                                                   CODEX_THREAD_ID=thread))
+                self.assertEqual(release["action"], "no-lease")
+                busy = self.result(self.session("ensure", anchor, "--json",
+                                                CODEX_THREAD_ID=thread), 8)
+                self.assertIn("before a resume", busy["message"])
+                self.assertTrue(self.lease_file(token).exists())
+        self.assertEqual(self.result(self.session("release", anchor, "--json",
+                                                 CODEX_THREAD_ID="thread-a"))["lease"], token)
+        previous = self.acquire(anchor)["lease"]
+        self.assertIsNone(self.whoami(anchor, CODEX_THREAD_ID="thread-a")["lease"])
+        self.assertEqual(self.whoami(anchor)["lease"], previous)
+
+    def test_claude_session_id_matches_and_older_lease_without_id_is_compatible(self):
+        self.create(NAME)
+        anchor = self.set_anchor()
+        token = self.acquire(anchor, CLAUDE_CODE_SESSION_ID="claude-a")["lease"]
+        current = self.whoami(anchor, CLAUDE_CODE_SESSION_ID="claude-a")
+        self.assertEqual((current["anchor"]["session"], current["lease"]), ("claude-a", token))
+        for session in ("claude-b", ""):
+            with self.subTest(session=session):
+                self.assertIsNone(self.whoami(anchor, CLAUDE_CODE_SESSION_ID=session)["lease"])
+                release = self.result(self.session("release", anchor, "--json",
+                                                   CLAUDE_CODE_SESSION_ID=session))
+                self.assertEqual(release["action"], "no-lease")
+        self.assertEqual(self.result(self.session("release", anchor, "--json",
+                                                 CLAUDE_CODE_SESSION_ID="claude-a"))["lease"],
+                         token)
+        previous = self.acquire(anchor)["lease"]
+        current = self.whoami(anchor, CLAUDE_CODE_SESSION_ID="claude-a")
+        self.assertEqual(current["lease"], previous)
+        self.assertEqual(self.result(self.session("release", anchor, "--json",
+                                                 CLAUDE_CODE_SESSION_ID="claude-a"))["lease"],
+                         previous)
+
+    def test_null_anchor_matches_only_another_null_anchor(self):
+        self.create(NAME)
+        anchor = self.set_anchor()
+        token = self.acquire(anchor)["lease"]
+        no_ancestors = self.ps_snapshot()
+        scope = ("--lease-scope", str(self.scope))
+        found = self.result(self.helper_cli(no_ancestors, "whoami", NAME, *scope, "--json"))
+        self.assertEqual((found["anchor"], found["lease"]), (None, None))
+        released = self.result(self.helper_cli(no_ancestors, "release", NAME, "--lease", "auto",
+                                               *scope, "--json"))
+        self.assertEqual((released["action"], released["lease"]), ("no-lease", None))
+        self.assertTrue(self.lease_file(token).exists())
+        self.result(self.sv("release", NAME, "--lease", token, "--json"))
+        acquired = self.result(self.helper_cli(no_ancestors, "ensure", NAME, "--lease", "auto",
+                                               *scope, "--json"))
+        token = acquired["lease"]
+        self.assertIsNone(json.loads(self.lease_file(token).read_text())["anchor"])
+        self.assertIsNone(self.whoami(anchor)["lease"])
+        self.assertEqual(self.result(self.helper_cli(no_ancestors, "whoami", NAME, *scope,
+                                                    "--json"))["lease"], token)
+        released = self.result(self.helper_cli(no_ancestors, "release", NAME, "--lease", "auto",
+                                               *scope, "--json"))
+        self.assertEqual((released["action"], released["lease"]), ("released", token))
+
+    def test_failed_process_inspection_never_creates_or_resolves_a_lease(self):
+        udid = self.create(NAME)
+        no_ancestors = self.ps_snapshot()
+        scope = ("--lease-scope", str(self.scope))
+        options = (NAME, "--lease", "auto", *scope, "--json")
+        token = self.result(self.helper_cli(no_ancestors, "ensure", *options, "--boot"))["lease"]
+        path = self.lease_file(token)
+        original = path.read_bytes()
+        bad_ps = """
         import subprocess
         real_run = subprocess.run
         def run(argv, **opts):
             if argv[0] == "/bin/ps" and "-axww" in argv:
-                return subprocess.CompletedProcess(argv, 0, stdout="")
+                {failure}
             return real_run(argv, **opts)
         subprocess.run = run
         """
-        scope = ("--lease-scope", str(self.scope))
-        env = {"SIM_VAULT_ANCHOR_PID": "", "CLAUDE_PID": ""}
-        found = self.result(self.helper_cli(no_ancestors, "whoami", NAME, *scope, "--json", **env))
-        self.assertEqual((found["anchor"], found["lease"]), (None, token))
-        released = self.result(self.helper_cli(no_ancestors, "release", NAME, "--lease", "auto",
-                                               *scope, "--json", **env))
-        self.assertEqual((released["action"], released["lease"]), ("released", token))
-        acquired = self.result(self.helper_cli(no_ancestors, "ensure", NAME, "--lease", "auto",
-                                               *scope, "--json", **env))
-        record = json.loads(self.lease_file(acquired["lease"]).read_text())
-        self.assertIsNone(record["anchor"])
+        failures = ("return subprocess.CompletedProcess(argv, 1, stdout='')",
+                    "raise subprocess.TimeoutExpired(argv, 5)")
+        for failure in failures:
+            with self.subTest(failure=failure):
+                observation = bad_ps.format(failure=failure)
+                for arguments in (("whoami", NAME, *scope, "--json"),
+                                  ("release", *options, "--shutdown")):
+                    no_lease = self.result(self.helper_cli(observation, *arguments))
+                    self.assertEqual((no_lease["action"], no_lease["lease"]), ("no-lease", None))
+                    self.assertIn("process inspection failed", no_lease["message"].lower())
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(self.state(udid), "Booted")
+                other = self.scope.with_name("other")
+                other.mkdir(exist_ok=True)
+                failed = self.result(self.helper_cli(observation, "ensure", NAME, "--lease",
+                                                     "auto", "--lease-scope", str(other),
+                                                     "--json"), 1)
+                self.assertIn("process inspection failed", failed["message"].lower())
+                self.assertEqual(set(path.parent.glob("*.json")),
+                                 {path, path.with_name("_boot.json")})
+
+    def test_apfs_aliases_resolve_to_the_same_scope(self):
+        self.create(NAME)
+        for spelling, equivalent in (("WorkTree-Capital", "worktree-capital"),
+                                     ("Café", unicodedata.normalize("NFD", "Café"))):
+            with self.subTest(spelling=spelling):
+                scope = self.scope.with_name(spelling)
+                alias = self.scope.with_name(equivalent)
+                scope.mkdir()
+                if not alias.is_dir():
+                    self.skipTest(f"filesystem does not equate {spelling!r} and {equivalent!r}")
+                anchor = self.set_anchor()
+                token = self.acquire(anchor, scope=alias)["lease"]
+                self.assertEqual(json.loads(self.lease_file(token).read_text())["scope"],
+                                 str(scope.resolve()))
+                self.assertEqual(self.result(self.session("ensure", anchor, "--json",
+                                                         scope=scope), 8)["kind"], "busy")
+                self.assertEqual(self.whoami(anchor, scope)["lease"], token)
+                released = self.result(self.session("release", anchor, "--json", scope=scope))
+                self.assertEqual(released["lease"], token)
+
+    def test_scope_alias_from_an_earlier_lease_still_blocks_and_resolves(self):
+        scope = self.scope.with_name("Café")
+        alias = self.scope.with_name(unicodedata.normalize("NFD", scope.name))
+        scope.mkdir()
+        if not alias.is_dir():
+            self.skipTest("filesystem does not equate NFC and NFD")
+        self.create(NAME)
+        anchor = self.set_anchor()
+        token = self.acquire(anchor, scope=scope)["lease"]
+        path = self.lease_file(token)
+        record = json.loads(path.read_text())
+        record["scope"] = str(alias.resolve())
+        path.write_text(json.dumps(record))
+        self.assertEqual(self.result(self.session("ensure", anchor, "--json",
+                                                 scope=scope), 8)["kind"], "busy")
+        self.assertEqual(self.result(self.session("release", anchor, "--json",
+                                                 scope=scope))["lease"], token)
+
+    def test_scope_must_be_a_non_empty_existing_directory(self):
+        anchor = self.set_anchor()
+        file = self.scope / "file"
+        file.touch()
+        for scope in ("", str(self.scope / "missing"), str(file)):
+            for command in ("ensure", "release", "whoami"):
+                with self.subTest(scope=scope, command=command):
+                    lease_args = () if command == "whoami" else ("--lease", "auto")
+                    proc = self.sv(command, NAME, *lease_args, "--lease-scope", scope, "--json",
+                                   SIM_VAULT_ANCHOR_PID=anchor.pid)
+                    result = self.result(proc, 2)
+                    self.assertEqual(result["kind"], "usage")
+                    self.assertIn("--lease-scope", result["message"])
+
+    def test_auto_requires_scope_on_ensure_and_release(self):
+        self.create(NAME)
+        for command in ("ensure", "release"):
+            with self.subTest(command=command):
+                result = self.result(self.sv(command, NAME, "--lease", "auto", "--json"), 2)
+                self.assertEqual(result["kind"], "usage")
+                self.assertIn("--lease-scope", result["message"])
 
     def test_claude_override_must_be_an_ancestor(self):
         outsider = self.set_anchor()
+        fallback = self.set_anchor()
         args = ("whoami", NAME, "--lease-scope", str(self.scope), "--json")
-        proc = self.sv(*args, CLAUDE_PID=outsider.pid, SIM_VAULT_ANCHOR_PID="")
+        observation = self.ps_snapshot(fallback.pid, f"{fallback.pid} 1 /bin/codex\n")
+        proc = self.helper_cli(observation, *args, CLAUDE_PID=outsider.pid)
         found = self.result(proc)["anchor"]
-        if found:
-            self.assertNotEqual(found["pid"], outsider.pid)
+        self.assertIsNotNone(found)
+        self.assertEqual((found["pid"], found["foundBy"]), (fallback.pid, "ancestor"))
         # Run the same loader from a known parent identified through CLAUDE_PID.
         launcher = textwrap.dedent("""
             import os, subprocess, sys
@@ -190,22 +354,34 @@ class SessionLeaseTests(SessionLeaseCase):
 
     def test_ancestor_allowlist_uses_nearest_basename(self):
         first, second = self.set_anchor(), self.set_anchor()
-        observation = f"""
-        import subprocess
-        real_run = subprocess.run
-        def run(argv, **opts):
-            if argv[0] == "/bin/ps" and "-axww" in argv:
-                rows = f"{{os.getpid()}} {first.pid} python\\n"
-                rows += "{first.pid} {second.pid} /bin/-tmux\\n{second.pid} 1 /bin/codex\\n"
-                return subprocess.CompletedProcess(argv, 0, stdout=rows)
-            return real_run(argv, **opts)
-        subprocess.run = run
-        """
+        observation = self.ps_snapshot(first.pid,
+                                       f"{first.pid} {second.pid} /bin/-tmux\n{second.pid} 1 /bin/codex\n")
         found = self.result(self.helper_cli(observation, "whoami", NAME, "--lease-scope",
                                             str(self.scope), "--json", CLAUDE_PID="",
                                             SIM_VAULT_ANCHOR_PID=""))["anchor"]
         self.assertEqual((found["pid"], found["comm"], found["foundBy"]),
                          (first.pid, "tmux", "ancestor"))
+
+    def test_ancestor_parser_skips_incomplete_rows_and_strips_comm(self):
+        anchor = self.set_anchor()
+        observation = self.ps_snapshot(anchor.pid, f"unparseable\n20 1\n21 n /bin/login\n"
+                                                   f"{anchor.pid} 1 /bin/-codex  \n")
+        proc = self.helper_cli(observation, "whoami", NAME, "--lease-scope", str(self.scope),
+                               "--json", CODEX_THREAD_ID="thread")
+        found = self.result(proc)["anchor"]
+        self.assertEqual((found["pid"], found["comm"], found["session"]),
+                         (anchor.pid, "codex", "thread"))
+
+    def test_unreadable_lease_refuses_auto_ensure(self):
+        self.create(NAME)
+        anchor = self.set_anchor()
+        token = self.acquire(anchor)["lease"]
+        path = self.lease_file(token)
+        path.write_text("{incomplete")
+        result = self.result(self.session("ensure", anchor, "--json"), 1)
+        self.assertEqual(result["kind"], "lease-unreadable")
+        self.assertIn(path.name, result["message"])
+        self.assertEqual(list(path.parent.glob("*.json")), [path])
 
     def test_ps_start_time_is_not_compared_against_kernel_time(self):
         self.create(NAME)
@@ -246,6 +422,8 @@ class SessionLeaseTests(SessionLeaseCase):
         self.assertEqual((fresh["anchorAlive"], fresh["scopeExists"], fresh["overdue"]),
                          (True, True, False))
         self.stop_child(anchor)
+        busy = self.result(self.session("ensure", self.set_anchor(), "--json"), 8)
+        self.assertIn("anchor exited", busy["message"])
         self.scope.rmdir()
         self.xcrun("delete", udid)
         record = json.loads(path.read_text())
@@ -258,9 +436,8 @@ class SessionLeaseTests(SessionLeaseCase):
         self.assertGreater(aged["ageSeconds"], 4 * 3600)
         human = self.sv("status", NAME)
         self.assertIn("anchorAlive=False scopeExists=False", human.stderr)
-        busy = self.result(self.session("ensure", self.set_anchor(), "--json"), 8)
-        self.assertIn("anchor exited", busy["message"])
-        self.assertIn("scope missing", busy["message"])
+        invalid = self.result(self.session("ensure", self.set_anchor(), "--json"), 2)
+        self.assertEqual(invalid["kind"], "usage")
         self.result(self.sv("gc", "--json"))
         self.assertTrue(path.exists())
         self.create(NAME)
@@ -290,14 +467,32 @@ class SessionLeaseTests(SessionLeaseCase):
                 self.result(self.sv("release", name, "--lease", owner, "--json"))
                 self.result(self.sv(*args, **env))
 
+    def test_legacy_owner_file_uses_the_scope_spelling_known_to_the_wrapper(self):
+        name = "DD iPhone 18 Pro"
+        self.create(name)
+        scope = self.scope.with_name("WorkTree-Old")
+        scope.mkdir()
+        alias = scope.with_name("worktree-old")
+        if not alias.is_dir():
+            self.skipTest("filesystem is case sensitive")
+        owner = "dd:up:old"
+        self.result(self.sv("ensure", name, "--lease", owner, "--json"))
+        scope_hash = hashlib.sha1(os.fsencode(alias.resolve())).hexdigest()
+        directory = self.state_root / "owners"
+        directory.mkdir()
+        (directory / f"daydo-{scope_hash}-iphone").write_text(owner + "\n")
+        proc = self.sv("ensure", name, "--lease", "auto", "--lease-scope", str(alias), "--json",
+                       SIM_VAULT_ANCHOR_PID=self.set_anchor().pid)
+        self.assertIn(owner, self.result(proc, 8)["message"])
+
     def test_history_records_session_held_and_legacy_kinds(self):
         self.create(NAME)
         anchor = self.set_anchor()
         self.acquire(anchor)
         self.result(self.session("ensure", anchor, "--json"), 8)
         self.result(self.session("release", anchor, "--json"))
-        self.result(self.sv("ensure", NAME, "--lease", "auto", "--json"))
-        self.result(self.sv("release", NAME, "--lease", "auto", "--json"))
+        self.result(self.sv("ensure", NAME, "--lease", "manual", "--json"))
+        self.result(self.sv("release", NAME, "--lease", "manual", "--json"))
         self.result(self.sv("release", NAME, "--lease", "missing", "--json"))
         run = self.sv("run", NAME, "--lease", "test", "--", "/usr/bin/true")
         self.assertEqual(run.returncode, 0, run.stderr)
@@ -333,18 +528,24 @@ class SessionLeaseTests(SessionLeaseCase):
 class MixedVersionTests(SessionLeaseCase):
     def setUp(self):
         super().setUp()
+        git = ["git", "-C", str(REPO)]
+        tag = subprocess.run([*git, "rev-parse", "--verify", "--quiet", "refs/tags/v3.1.0"],
+                             capture_output=True)
+        if tag.returncode == 1:
+            self.skipTest("v3.1.0 tag is unavailable; fetch tags to run mixed-version tests")
+        tag.check_returncode()
         self.old_script = Path(self.base) / "sim-vault-v3.py"
         with self.old_script.open("wb") as handle:
-            subprocess.run(["git", "-C", str(REPO), "show", "v3.1.0:src/sim_vault/__init__.py"],
-                           stdout=handle, check=True)
+            subprocess.run([*git, "show", "v3.1.0:src/sim_vault/__init__.py"], stdout=handle,
+                           check=True)
 
     def v3(self, *args):
         return self.sv(*args, "--json", SV_TEST_SCRIPT=self.old_script)
 
     @contextmanager
-    def run_holder(self):
+    def run_holder(self, *args):
         child = subprocess.Popen(
-            [PY, self.loader, "run", NAME, "--lease", "mixed", "--", PY, "-c",
+            [PY, self.loader, "run", NAME, "--lease", "mixed", *args, "--", PY, "-c",
              "import os, sys; print(os.environ['SIM_VAULT_LEASE'], flush=True); sys.stdin.read()"],
             env=self.env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True,
@@ -402,3 +603,10 @@ class MixedVersionTests(SessionLeaseCase):
         released = self.result(self.sv("release", NAME, "--lease", "old", "--shutdown", "--json"))
         self.assertEqual((released["action"], released["shutdown"]), ("released", True))
         self.assertEqual(self.state(udid), "Shutdown")
+
+    def test_v3_shared_ensure_refuses_v4_held_lease_acquired_with_deny_other_leases(self):
+        self.create(NAME)
+        with self.run_holder("--deny-other-leases") as owner:
+            result = self.result(self.v3("ensure", NAME, "--lease", "old-shared"), 8)
+            self.assertEqual(result["kind"], "busy")
+            self.assertIn(owner, result["message"])

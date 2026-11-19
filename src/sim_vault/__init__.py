@@ -803,34 +803,46 @@ def process_identity(pid):
 SESSION_ANCESTOR_COMMS = {"claude", "codex", "login", "sshd", "sshd-session", "tmux"}
 
 
+class ProcessInspectionFailed(Exception):
+    pass
+
+
 def ps_output(*args):
     try:
         result = subprocess.run(["/bin/ps", *args], capture_output=True, text=True,
                                 errors="replace", env=dict(os.environ, LC_ALL="C", TZ="UTC"),
                                 timeout=5)
     except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return result.stdout if result.returncode == 0 else ""
+        return None
+    return result.stdout if result.returncode == 0 else None
 
 
 def comm_basename(comm):
-    return os.path.basename(comm).lstrip("-")
+    return os.path.basename(comm.strip()).lstrip("-")
 
 
 def process_ancestors():
+    error = "Process inspection failed; could not determine the session anchor"
+    output = ps_output("-axww", "-o", "pid=,ppid=,comm=")
+    if output is None:
+        raise ProcessInspectionFailed(error)
     processes = {}
-    for row in ps_output("-axww", "-o", "pid=,ppid=,comm=").splitlines():
-        pid, parent, comm = row.split(None, 2)
-        processes[int(pid)] = int(parent), comm_basename(comm)
+    for row in output.splitlines():
+        parts = row.split(None, 2)
+        if len(parts) == 3 and parts[0].isdecimal() and parts[1].isdecimal():
+            pid, parent, comm = parts
+            processes[int(pid)] = int(parent), comm_basename(comm)
     pid = os.getpid()
     ancestors = {}
     while pid in processes:
         parent, _ = processes[pid]
+        if parent == 0:
+            return ancestors
         if parent not in processes or parent in ancestors:
             break
         ancestors[parent] = processes[parent][1]
         pid = parent
-    return ancestors
+    raise ProcessInspectionFailed(error)
 
 
 def env_pid(key):
@@ -842,7 +854,8 @@ def env_pid(key):
 
 
 def ps_identity(pid):
-    parts = ps_output("-ww", "-p", str(pid), "-o", "lstart=,comm=").split(None, 5)
+    output = ps_output("-ww", "-p", str(pid), "-o", "lstart=,comm=")
+    parts = output.split(None, 5) if output is not None else []
     if len(parts) == 6:
         return " ".join(parts[:5]), parts[5].strip()
     return None
@@ -855,9 +868,20 @@ def anchor_record(pid, found_by, comm=None):
         identity = ps_identity(pid)
         source = "ps" if identity is not None else None
     start, observed_comm = identity if identity is not None else (None, None)
-    return {"pid": pid, "startedAt": start, "startSource": source,
-            "comm": comm or (comm_basename(observed_comm) if observed_comm else None),
-            "foundBy": found_by}
+    comm = comm or (comm_basename(observed_comm) if observed_comm else None)
+    anchor = {"pid": pid, "startedAt": start, "startSource": source,
+              "comm": comm, "foundBy": found_by}
+    if comm == "codex":
+        session_source = "CODEX_THREAD_ID"
+    elif comm == "claude" or found_by == "CLAUDE_PID":
+        session_source = "CLAUDE_CODE_SESSION_ID"
+    else:
+        # A shell or a test override can be the process anchor for either harness.
+        session_source = "CODEX_THREAD_ID" if os.environ.get("CODEX_THREAD_ID") else "CLAUDE_CODE_SESSION_ID"
+    session = os.environ.get(session_source)
+    if session:
+        anchor.update(session=session, sessionSource=session_source)
+    return anchor
 
 
 def session_anchor():
@@ -868,19 +892,25 @@ def session_anchor():
     claude = env_pid("CLAUDE_PID")
     if claude in ancestors:
         return anchor_record(claude, "CLAUDE_PID", ancestors[claude])
-    # Codex exposes session/thread IDs rather than a PID. Its comm is on this allow-list.
+    # Codex's process is found via this allow-list. Its thread ID identifies the session.
     for pid, comm in ancestors.items():
         if comm in SESSION_ANCESTOR_COMMS:
             return anchor_record(pid, "ancestor", comm)
     return None
 
 
-def same_anchor(first, second):
-    if first is None or second is None:
-        return first is second
-    return (first["pid"] == second["pid"] and first["startedAt"] is not None
-            and first["startSource"] == second["startSource"]
-            and first["startedAt"] == second["startedAt"])
+def same_anchor(stored, caller):
+    if stored is None or caller is None:
+        return stored is caller
+    if (stored["pid"] != caller["pid"] or stored["startedAt"] is None
+            or stored["startSource"] != caller["startSource"]
+            or stored["startedAt"] != caller["startedAt"]):
+        return False
+    stored_session = stored.get("session")
+    if (stored_session is None and caller.get("sessionSource") == "CLAUDE_CODE_SESSION_ID"
+            and stored.get("comm") != "codex"):
+        return True
+    return stored_session == caller.get("session")
 
 
 def anchor_alive(anchor):
@@ -897,9 +927,43 @@ def anchor_alive(anchor):
     return identity is None or identity[0] == anchor["startedAt"]
 
 
-def session_lease(leases, scope, anchor=None):
-    return next((l for l in leases if l.get("kind") == "session" and l.get("scope") == scope
-                 and (anchor is None or same_anchor(l.get("anchor"), anchor))), None)
+def canonical_scope(path):
+    try:
+        if sys.platform != "darwin":
+            if os.path.isdir(path):
+                return os.path.realpath(path)
+            raise NotADirectoryError(path)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            # Darwin's F_GETPATH returns the filesystem's spelling of the directory.
+            return os.fsdecode(fcntl.fcntl(fd, 50, bytes(1024)).split(b"\0", 1)[0])
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise Fail(f"--lease-scope must be an existing directory ({path!r}): {exc}",
+                   EXIT_USAGE, "usage", "pass an existing directory with --lease-scope") from exc
+
+
+def same_scope(stored, scope):
+    if stored == scope:
+        return True
+    if not isinstance(stored, str):
+        return False
+    # Older leases used realpath, which may have kept an alternate APFS spelling.
+    try:
+        return os.path.samefile(stored, scope)
+    except OSError:
+        return False
+
+
+def scoped_sessions(leases, scope):
+    return (lease for lease in leases if lease.get("kind") == "session"
+            and same_scope(lease.get("scope"), scope))
+
+
+def session_lease(leases, scope, anchor):
+    return next((lease for lease in scoped_sessions(leases, scope)
+                 if same_anchor(lease.get("anchor"), anchor)), None)
 
 
 def whoami(name, scope, anchor):
@@ -923,26 +987,31 @@ def session_busy(name, lease, caller_anchor):
                 EXIT_BUSY, "busy", shlex.join(["sim-vault", "release", name, "--lease", owner]))
 
 
-def legacy_scope_lease(name, scope, leases):
+def legacy_scope_lease(name, scopes, leases):
     """Keep the old DayDo/DSA owner-file guard during the wrapper transition."""
-    scope_key = hashlib.sha1(os.fsencode(scope)).hexdigest()
     if name.startswith("DD "):
         aliases = {"DD iPhone 18 Pro": "iphone", "DD iPad Pro 11": "ipad"}
+        project = "daydo"
         target = aliases.get(name, re.sub(r"[^A-Za-z0-9]", "_", name))
-        filename = f"daydo-{scope_key}-{target}"
     elif name.startswith("DSA ") and "/" not in name:
-        filename = f"dsa-{scope_key}-{name.replace(' ', '-')}"
+        project = "dsa"
+        target = name.replace(" ", "-")
     else:
         return None
-    path = os.path.join(STATE_ROOT, "owners", filename)
-    try:
-        with open(path, encoding="utf-8", errors="surrogateescape") as handle:
-            owner = handle.read().rstrip("\n")
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise unreadable_lease(path, exc) from exc
-    return next((l for l in leases if l["owner"] == owner), None)
+    for scope in scopes:
+        scope_key = hashlib.sha1(os.fsencode(scope)).hexdigest()
+        path = os.path.join(STATE_ROOT, "owners", f"{project}-{scope_key}-{target}")
+        try:
+            with open(path, encoding="utf-8", errors="surrogateescape") as handle:
+                owner = handle.read().rstrip("\n")
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise unreadable_lease(path, exc) from exc
+        previous = next((lease for lease in leases if lease["owner"] == owner), None)
+        if previous:
+            return previous
+    return None
 
 
 def verified_held_holder(lease):
@@ -1761,14 +1830,14 @@ def restore(name, wait=DEFAULT_WAIT):
 
 def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFAULT_WAIT,
            deny_other_leases=False, allow_leases=(), *, held_lease=False, expect_udid=None,
-           session=None, lease_prefix=None):
+           session=None, lease_prefix=None, lease_scope=None):
     warnings = []
     if lease:
         note(leaseKind="session" if session is not None else "held" if held_lease else "legacy")
     with DeviceLock(name, wait), ExitStack() as held_fd:
         fd = None
         if session is not None:
-            previous = session_lease(read_leases(name), session["scope"])
+            previous = next(scoped_sessions(read_leases(name, strict=True), session["scope"]), None)
             if previous:
                 raise session_busy(name, previous, session["anchor"])
             lease = f"{lease_prefix or 'auto'}:{secrets.token_hex(4)}"
@@ -1808,7 +1877,9 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
             note(leaseKind="session")
             raise leased_fail(name, mine)
         if session is not None:
-            previous = legacy_scope_lease(name, session["scope"], manual)
+            # The wrappers' pwd -P can preserve the caller's APFS spelling.
+            scopes = dict.fromkeys((session["scope"], os.path.realpath(lease_scope)))
+            previous = legacy_scope_lease(name, scopes, manual)
             if previous:
                 raise Fail(f"'{name}' has a legacy lease {previous['owner']} recorded for this scope",
                            EXIT_BUSY, "busy",
@@ -2489,7 +2560,7 @@ def build_parser():
 
     def scope_flag(p, *, required=False):
         p.add_argument("--lease-scope", metavar="DIR", required=required,
-                       help="worktree directory for the session lease, resolved to its real path")
+                       help="existing worktree directory for the session lease, using its canonical path")
 
     def acquisition_flags(p, *, held=False):
         p.add_argument("--create", metavar="TYPE",
@@ -2729,13 +2800,34 @@ def main():
                        "add --deny-other-leases, or drop --allow-lease")
         scope = getattr(args, "lease_scope", None)
         prefix = getattr(args, "lease_prefix", None)
+        auto_lease = args.command in ("ensure", "release") and args.lease == "auto"
+        if auto_lease and scope is None:
+            raise Fail("--lease auto requires --lease-scope", EXIT_USAGE, "usage",
+                       "use --lease auto --lease-scope DIR")
+        if (scope is not None or prefix is not None) and not (auto_lease or args.command == "whoami"):
+            raise Fail("--lease-scope and --lease-prefix are for auto leases", EXIT_USAGE,
+                       "usage", "use --lease auto --lease-scope DIR")
         session = None
-        if scope is not None or prefix is not None:
-            if args.command != "whoami" and (args.lease != "auto" or scope is None):
-                raise Fail("--lease-scope and --lease-prefix are for auto leases", EXIT_USAGE,
-                           "usage", "use --lease auto --lease-scope DIR")
-            session = {"scope": os.path.realpath(scope), "anchor": session_anchor()}
-        if args.command == "status":
+        inspection_error = None
+        if scope is not None:
+            normalized_scope = canonical_scope(scope)
+            try:
+                session = {"scope": normalized_scope, "anchor": session_anchor()}
+            except ProcessInspectionFailed as exc:
+                inspection_error = str(exc)
+        if inspection_error:
+            if auto_lease:
+                note(leaseKind="session")
+            if args.command == "ensure":
+                raise Fail(inspection_error, kind="process-inspection-failed",
+                           next_step="retry process inspection or use an explicit --lease OWNER")
+            log(inspection_error)
+            result = {"action": "no-lease", "lease": None, "message": inspection_error}
+            if args.command == "whoami":
+                result["anchor"] = None
+            else:
+                result.update(shutdown=False, remaining=[])
+        elif args.command == "status":
             result = status(args.name)
             if not as_json:
                 if result["udid"]:
@@ -2756,7 +2848,7 @@ def main():
         elif args.command == "ensure":
             result = ensure(args.name, args.create, args.boot, args.lease, args.exclusive,
                             args.wait, args.deny_other_leases, args.allow_lease,
-                            session=session, lease_prefix=prefix)
+                            session=session, lease_prefix=prefix, lease_scope=scope)
             if session is not None:
                 write_stderr(f"lease: {result['lease']}")
             if not as_json:
