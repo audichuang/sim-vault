@@ -74,6 +74,7 @@ exit codes and what the caller does next:
      archive can still be restored: stop and report; do not delete or park on your own
 """
 import argparse
+import ctypes
 from datetime import datetime
 import fcntl
 import hashlib
@@ -81,6 +82,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -524,10 +526,10 @@ class DeviceLock:
     gone, so there is nothing to reclaim. The file is never deleted: a waiter holding the old
     inode would get in alongside a newcomer on the new one."""
 
-    def __init__(self, name, wait=DEFAULT_WAIT):
-        self.name = name
+    def __init__(self, name, wait=DEFAULT_WAIT, *, key=None):
+        self.name = name or key
         self.wait = wait
-        self.path = lock_path(name)
+        self.path = lock_path(name) if key is None else os.path.join(LOCK_DIR, key + ".lock")
         self.fd = None
 
     def __enter__(self):
@@ -566,10 +568,10 @@ class DeviceLock:
         os.close(self.fd)
 
 
-def try_lock(name):
+def try_lock(name, *, key=None):
     """Non-blocking DeviceLock for gc: an entered lock (leave it with __exit__), or None
     when someone holds it."""
-    lock = DeviceLock(name, wait=0)
+    lock = DeviceLock(name, wait=0, key=key)
     try:
         return lock.__enter__()
     except Fail:
@@ -623,7 +625,11 @@ def lease_dir(name):
 
 
 def lease_path(name, owner):
-    return os.path.join(lease_dir(name), hashlib.sha1(owner.encode()).hexdigest() + ".json")
+    return os.path.join(lease_dir(name), lease_filename(owner))
+
+
+def lease_filename(owner):
+    return hashlib.sha1(owner.encode()).hexdigest() + ".json"
 
 
 def held_lock_path(path):
@@ -641,7 +647,14 @@ def lease_entries(directory):
         return []
 
 
-def read_lease_files(directory, entries, strict=False, quiet=False):
+def unreadable_lease(path, exc):
+    return Fail(f"cannot read lease {path}: {exc}; it may be someone's live lease, "
+                "so nothing was shut down or deleted", kind="lease-unreadable",
+                next_step="fix its permissions or find out whose it is; remove it "
+                          "by hand only once you know it is stale")
+
+
+def read_lease_files(directory, entries, strict=False, quiet=False, unreadable=None):
     """strict: a lease that cannot be read or is not a lease raises Fail (lease-unreadable)
     instead of being skipped, for commands that act on "nobody uses it" (park, shutdown,
     ensure --deny-other-leases): an unreadable lease may be someone's live one."""
@@ -660,10 +673,9 @@ def read_lease_files(directory, entries, strict=False, quiet=False):
             continue   # released meanwhile
         except (OSError, ValueError) as exc:
             if strict:
-                raise Fail(f"cannot read lease {path}: {exc}; it may be someone's live lease, "
-                           "so nothing was shut down or deleted", kind="lease-unreadable",
-                           next_step="fix its permissions or find out whose it is; remove it "
-                                     "by hand only once you know it is stale")
+                raise unreadable_lease(path, exc)
+            if unreadable is not None:
+                unreadable.append(path)
             if not quiet:
                 log(f"warning: unreadable lease {entry}: {exc}")
     return out
@@ -696,62 +708,91 @@ def scan_held_leases(directory, entries, leases):
     for entry in entries:
         if entry.endswith(".lock"):
             by_lock.setdefault(os.path.join(directory, entry), {"kind": "held", "mode": "exclusive"})
-    return [dict(lease, lockFile=path, alive=held_alive(path))
-            for path, lease in sorted(by_lock.items())]
+    held = []
+    for path, lease in sorted(by_lock.items()):
+        try:
+            held.append(dict(lease, lockFile=path, alive=held_alive(path)))
+        except OSError as exc:
+            held.append(dict(lease, lockFile=path, alive=True, unreadable=str(exc)))
+    return held
 
 
-def lease_snapshot(name, quiet=False):
-    directory = lease_dir(name)
+def lease_snapshot(directory, quiet=False):
     entries = lease_entries(directory)
-    leases = read_lease_files(directory, entries, quiet=quiet)
-    return leases, scan_held_leases(directory, entries, leases)
+    unreadable = []
+    leases = read_lease_files(directory, entries, quiet=quiet, unreadable=unreadable)
+    return leases, scan_held_leases(directory, entries, leases), unreadable
 
 
-def held_holders(leases):
-    """Best-effort diagnostics. Liveness is determined by flock, never by lsof."""
-    paths = {os.path.realpath(l["lockFile"]): l["lockFile"] for l in leases if l["alive"]}
-    holders = {path: {} for path in paths.values()}
-    if not paths:
-        return holders
-    lsof = shutil.which("lsof") or shutil.which("lsof", path="/usr/sbin")
-    if not lsof:
-        return holders
+class ProcBsdInfo(ctypes.Structure):
+    # struct proc_bsdinfo from Darwin's sys/proc_info.h (PROC_PIDTBSDINFO).
+    _fields_ = [("flags", ctypes.c_uint32), ("status", ctypes.c_uint32),
+                ("ids", ctypes.c_uint32 * 10), ("comm", ctypes.c_char * 16),
+                ("name", ctypes.c_char * 32), ("counts_and_tty", ctypes.c_uint32 * 6),
+                ("start_seconds", ctypes.c_uint64), ("start_microseconds", ctypes.c_uint64)]
+
+
+def process_identity(pid):
+    """Return the kernel's microsecond start time and command name for a live PID."""
+    if sys.platform != "darwin" or type(pid) is not int or not 0 < pid < 2**31:
+        return None
     try:
-        # -b disables the stat calls lsof needs for a path argument; match name fields instead.
-        result = subprocess.run([lsof, "-b", "-nP", "-Fpcn"], capture_output=True, text=True,
-                                errors="replace", timeout=2)
-    except (OSError, subprocess.TimeoutExpired):
-        return holders
-    pid, comm = None, None
-    for line in result.stdout.splitlines():
-        field, value = line[:1], line[1:]
-        if field == "p":
-            pid, comm = int(value), None
-        elif field == "c":
-            comm = value
-        elif field == "n" and value in paths and pid is not None:
-            holders[paths[value]][pid] = comm or "unknown command"
-    return holders
+        proc_pidinfo = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidinfo
+    except OSError:
+        return None
+    proc_pidinfo.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                             ctypes.c_void_p, ctypes.c_int)
+    info = ProcBsdInfo()
+    size = ctypes.sizeof(info)
+    if proc_pidinfo(pid, 3, 0, ctypes.byref(info), size) != size or info.status == 5:  # SZOMB
+        return None
+    start = info.start_seconds * 1_000_000 + info.start_microseconds
+    return start, os.fsdecode(info.name or info.comm)
+
+
+def verified_held_holder(lease):
+    if not lease["alive"] or lease.get("unreadable") or lease.get("pidStartedAt") is None:
+        return None
+    pid = lease.get("pid")
+    identity = process_identity(pid)
+    if identity and identity[0] == lease["pidStartedAt"]:
+        return pid, identity[1]
+    return None
 
 
 def held_label(lease):
     return "held lease " + (lease.get("owner") or os.path.basename(lease["lockFile"])[:8])
 
 
-def describe_held(lease, holders):
-    details = ", ".join(f"pid {pid} ({comm})" for pid, comm in sorted(holders.items()))
-    return f"{held_label(lease)} held by {details or 'another process'}"
+def describe_held(lease, holder):
+    if lease.get("unreadable"):
+        return f"{held_label(lease)} is unreadable: {lease['unreadable']}"
+    description = f"pid {holder[0]} ({holder[1]})" if holder else "a process that inherited its lock"
+    return f"{held_label(lease)} held by {description}"
+
+
+def require_readable_held(leases):
+    for lease in leases:
+        if lease.get("unreadable"):
+            raise unreadable_lease(lease["lockFile"], lease["unreadable"])
+
+
+def held_candidate_hint(lease):
+    return f"Find candidate processes with `lsof {shlex.quote(lease['lockFile'])}`."
 
 
 def held_leased_fail(name, leases):
-    holders = held_holders(leases)
-    descriptions = [describe_held(lease, holders.get(lease["lockFile"], {})) for lease in leases]
-    pids = sorted({pid for processes in holders.values() for pid in processes})
-    hint = "wait for the holder to finish; the held lease disappears once it exits"
-    if pids:
-        commands = " or ".join(f"`kill {pid}`" for pid in pids)
-        hint = f"if it is your own leftover process, use {commands}; {hint}"
-    return Fail(f"'{name}' is leased by {'; '.join(descriptions)}", EXIT_BUSY, "busy", hint)
+    require_readable_held(leases)
+    descriptions, tips = [], []
+    for lease in leases:
+        holder = verified_held_holder(lease)
+        descriptions.append(describe_held(lease, holder))
+        if holder:
+            tips.append(f"If it is your own leftover process, use `kill {holder[0]}`.")
+        else:
+            tips.append(held_candidate_hint(lease))
+    tips.append("Wait for the holder to finish. The held lease disappears once it exits.")
+    return Fail(f"'{name}' is leased by {'; '.join(descriptions)}", EXIT_BUSY, "busy", " ".join(tips))
 
 
 def write_held_lease(name, owner, udid, mode):
@@ -761,35 +802,47 @@ def write_held_lease(name, owner, udid, mode):
     """
     path = lease_path(name, owner)
     lock_file = held_lock_path(path)
-    lease = {"owner": owner, "udid": udid, "mode": mode, "kind": "held"}
+    try:
+        already_held = held_alive(lock_file)
+    except OSError as exc:
+        raise unreadable_lease(lock_file, exc) from exc
+    if already_held:
+        existing = read_holder(path)
+        if not isinstance(existing, dict) or existing.get("kind") != "held":
+            existing = {}
+        raise held_leased_fail(name, [dict(existing, lockFile=lock_file, alive=True)])
     if os.path.lexists(path):
-        if held_alive(lock_file):
-            raise held_leased_fail(name, [dict(lease, lockFile=lock_file, alive=True)])
         raise Fail(f"'{name}' already has a lease for {owner}", EXIT_BUSY, "busy",
                    f"wait for that run to finish; {stale_lease_hint(name)}")
-    os.makedirs(lease_dir(name), exist_ok=True)
-    fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o644)
+    directory = lease_dir(name)
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".held-", dir=directory)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise held_leased_fail(name, [dict(lease, lockFile=lock_file, alive=True)])
+        # Passive probes only open the final path. Publish an already locked inode.
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.replace(temporary, lock_file)
+        pid = os.getpid()
+        identity = process_identity(pid)
         stamp = now_iso()
-        try:
-            write_json(path, dict(lease, pid=os.getpid(), createdAt=stamp, updatedAt=stamp))
-        except BaseException:
-            remove_file(path + ".partial")
-            remove_file(lock_file)
-            raise
+        write_json(path, {"owner": owner, "name": name, "udid": udid, "mode": mode, "kind": "held",
+                          "pid": pid, "pidStartedAt": identity[0] if identity else None,
+                          "createdAt": stamp, "updatedAt": stamp})
     except BaseException:
         os.close(fd)
+        # The rename consumed the temporary path if the lock was published.
+        remove_file(temporary if os.path.exists(temporary) else lock_file)
+        remove_file(path + ".partial")
         raise
     return fd
 
 
 def read_boot_record(name):
+    return read_boot_record_file(boot_record_path(name))
+
+
+def read_boot_record_file(path):
     try:
-        with open(boot_record_path(name)) as handle:
+        with open(path) as handle:
             record = json.load(handle)
     except (OSError, ValueError):
         return None
@@ -849,36 +902,47 @@ def drop_stale_leases(name, present_udids):
         remove_file(boot_record_path(name))
 
 
-def release_boot_record(name, record, owners, remaining):
+def release_boot_record(path, record, owners, remaining):
     if not record:
         return
     if not remaining:
         # A later owner must not inherit shutdown duty for a device it did not boot.
-        remove_file(boot_record_path(name))
+        remove_file(path)
     elif any(owner in owners for owner in record.get("by", [])):
-        # Hand shutdown duty to the remaining owners with known identities.
-        record["by"] = [l["owner"] for l in remaining if l.get("owner") is not None]
-        write_json(boot_record_path(name), record)
+        # A rename can leave leases for two devices in the same directory.
+        record["by"] = [l["owner"] for l in remaining
+                        if l.get("udid") == record.get("udid") and l.get("owner") is not None]
+        write_json(path, record)
 
 
-def reap_held_leases(name, dry_run=False, *, snapshot=None):
+def reap_boot_record(directory, leases, live, dead):
+    path = os.path.join(directory, "_boot.json")
+    record = read_boot_record_file(path)
+    if not record:
+        return
+    udid = record.get("udid")
+    present = {d["udid"] for d in all_devices()}
+    if udid not in present:
+        remove_file(path)
+        return
+    owners = {lease["owner"] for lease in dead if lease.get("udid") == udid and "owner" in lease}
+    # A v3 release can remove the JSON. In that case the owner hash is all we have.
+    orphan_locks = {os.path.basename(l["lockFile"]) for l in dead if "file" not in l}
+    owners.update(o for o in record.get("by", [])
+                  if held_lock_path(lease_filename(o)) in orphan_locks)
+    if owners:
+        remaining = live + [l for l in leases if l.get("kind") != "held" and l.get("udid") in present]
+        release_boot_record(path, record, owners, remaining)
+
+
+def reap_held_leases(directory, dry_run=False, *, snapshot=None):
     """Under DeviceLock, drop dead held leases and reconcile their boot duty without shutdown."""
-    leases, held = snapshot if snapshot is not None else lease_snapshot(name, quiet=True)
+    leases, held, unreadable = snapshot if snapshot is not None else lease_snapshot(directory, quiet=True)
     live = [l for l in held if l["alive"]]
     dead = [l for l in held if not l["alive"]]
     if dead and not dry_run:
-        record = read_boot_record(name)
-        if record:
-            devices = all_devices()
-            record = reconcile_boot_record(name, devices)
-            if record:
-                present = {d["udid"] for d in devices}
-                remaining = live + [l for l in leases if l.get("kind") != "held"
-                                    and l.get("udid") in present]
-                dead_locks = {l["lockFile"] for l in dead}
-                owners = [o for o in record.get("by", [])
-                          if held_lock_path(lease_path(name, o)) in dead_locks]
-                release_boot_record(name, record, owners, remaining)
+        if not unreadable and not any(l.get("unreadable") for l in live):
+            reap_boot_record(directory, leases, live, dead)
         for lease in dead:
             if "file" in lease:
                 remove_file(lease["file"])
@@ -887,7 +951,7 @@ def reap_held_leases(name, dry_run=False, *, snapshot=None):
 
 
 def same_held_owner(name, owner, held):
-    if not owner:
+    if owner is None:
         return []
     path = held_lock_path(lease_path(name, owner))
     return [l for l in held if l["lockFile"] == path]
@@ -899,7 +963,8 @@ def lease_view(lease):
 
 
 def describe_leases(leases):
-    return "; ".join(f"{l.get('owner')} ({l.get('mode')}, since {l.get('createdAt')}, "
+    return "; ".join(describe_held(l, verified_held_holder(l)) if "lockFile" in l else
+                     f"{l.get('owner')} ({l.get('mode')}, since {l.get('createdAt')}, "
                      f"pid {l.get('pid')})" for l in leases)
 
 
@@ -1107,7 +1172,7 @@ def park(name, shutdown=False, replace=False, wait=DEFAULT_WAIT, busy_locks=(),
     vault = vault_dir()
     tar_path, meta_path = archive_paths(vault, name)
     with DeviceLock(name, wait):
-        held, _ = reap_held_leases(name)
+        held, _ = reap_held_leases(lease_dir(name))
         if held:
             raise held_leased_fail(name, held)
         if settle_pending(tar_path, meta_path) == "failed":
@@ -1483,7 +1548,7 @@ def restore_locked(name, warnings=None):
 def restore(name, wait=DEFAULT_WAIT):
     warnings = []
     with DeviceLock(name, wait):
-        reap_held_leases(name)
+        reap_held_leases(lease_dir(name))
         result = restore_locked(name, warnings)
     result["warnings"] = warnings
     return result
@@ -1493,10 +1558,12 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
            deny_other_leases=False, allow_leases=()):
     warnings = []
     with DeviceLock(name, wait):
-        held, _ = reap_held_leases(name)
+        held, _ = reap_held_leases(lease_dir(name))
         same_owner = same_held_owner(name, lease, held)
         if same_owner:
             raise held_leased_fail(name, same_owner)
+        if exclusive or deny_other_leases:
+            require_readable_held(held)
         blocking = blocking_leases(held, lease, exclusive, deny_other_leases, allow_leases)
         if blocking:
             raise held_leased_fail(name, blocking)
@@ -1603,12 +1670,15 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
 
 def release(name, lease, shutdown=False, wait=DEFAULT_WAIT):
     with DeviceLock(name, wait):
-        snapshot = lease_snapshot(name, quiet=True)
+        directory = lease_dir(name)
+        snapshot = lease_snapshot(directory, quiet=True)
         held = [l for l in snapshot[1] if l["alive"]]
-        blocking = held if shutdown else same_held_owner(name, lease, held)
+        blocking = same_held_owner(name, lease, held)
         if blocking:
             raise held_leased_fail(name, blocking)
-        reap_held_leases(name, snapshot=snapshot)
+        if shutdown:
+            require_readable_held(held)
+        reap_held_leases(directory, snapshot=snapshot)
         devices = all_devices()
         device = next((d for d in devices if d["name"] == name), None)
         if device:
@@ -1618,9 +1688,11 @@ def release(name, lease, shutdown=False, wait=DEFAULT_WAIT):
         path = lease_path(name, lease)
         existed = os.path.exists(path)
         # Strict with --shutdown: an unreadable lease may be someone's live one.
-        others = [l for l in read_leases(name, strict=shutdown)
-                  if l.get("kind") != "held" and l.get("owner") != lease] + held
-        responsible = bool(record) and existed and lease in record.get("by", [])
+        legacy = [l for l in read_leases(name, strict=shutdown) if l.get("kind") != "held"]
+        others = [l for l in legacy if l.get("owner") != lease] + held
+        mine = next((l for l in legacy if l["file"] == path), None)
+        same_device = bool(record and mine and mine.get("udid") == record.get("udid"))
+        responsible = same_device and lease in record.get("by", [])
         did_shutdown = False
         if shutdown and not others and responsible:
             # The lease stays until the device is down, so a failed shutdown can be rerun.
@@ -1635,8 +1707,8 @@ def release(name, lease, shutdown=False, wait=DEFAULT_WAIT):
             log(f"not shutting down: {lease} holds no lease on it")
         elif shutdown:
             log("not shutting down: sim-vault did not boot it under this lease")
-        if existed and not did_shutdown:
-            release_boot_record(name, record, [lease], others)
+        if same_device and not did_shutdown:
+            release_boot_record(boot_record_path(name), record, [lease], others)
         remove_file(path)
         return {"action": "released" if existed else "no-lease", "lease": lease,
                 "shutdown": did_shutdown, "remaining": [lease_view(l) for l in others]}
@@ -1646,7 +1718,7 @@ def shutdown_command(name, wait=DEFAULT_WAIT, busy_locks=()):
     """Shut <name> down under the device lock, unless an owner still holds a lease (8).
     Never restores and never needs the vault."""
     with DeviceLock(name, wait):
-        held, _ = reap_held_leases(name)
+        held, _ = reap_held_leases(lease_dir(name))
         if held:
             raise held_leased_fail(name, held)
         device = find_one(name)
@@ -1693,22 +1765,28 @@ def lease_age(lease):
     except (TypeError, ValueError):
         try:
             created = os.path.getmtime(lease.get("file") or lease["lockFile"])
-        except FileNotFoundError:
+        except OSError:
             return None
     return max(0, time.time() - created)
 
 
-def status_lease(lease, present, holders):
+def status_lease(lease, present):
     held = lease.get("kind") == "held"
     alive = lease["alive"] if held else True
     age = lease_age(lease)
     view = dict(lease_view(lease), kind="held" if held else "legacy", alive=alive,
-                ageSeconds=age, overdue=not held and age is not None and age > 4 * 3600,
+                ageSeconds=round(age) if age is not None else None,
+                overdue=not held and age is not None and age > 4 * 3600,
                 stale=not alive if held else lease.get("udid") not in present)
     if held:
         if view["owner"] is None:
             view["owner"] = held_label(lease)
-        view["holderPids"] = sorted(holders.get(lease["lockFile"], {}))
+        holder = verified_held_holder(lease)
+        view["holderPids"] = [holder[0]] if holder else []
+        if lease.get("unreadable"):
+            view["unreadable"] = lease["unreadable"]
+        elif alive and not holder:
+            view["holderHint"] = f"{describe_held(lease, None)}. {held_candidate_hint(lease)}"
     return view
 
 
@@ -1719,8 +1797,7 @@ def status(name):
     runtimes = list_runtimes()
     meta, info = archive_info(name, runtimes)
     present = {d["udid"] for d in devices}
-    leases, held = lease_snapshot(name)
-    holders = held_holders(held)
+    leases, held, _ = lease_snapshot(lease_dir(name))
     # Keep the existing file order, with lock-only leases appended.
     by_file = {l["file"]: l for l in held if "file" in l}
     leases = [by_file.get(l["file"], l) for l in leases] + [l for l in held if "file" not in l]
@@ -1737,7 +1814,7 @@ def status(name):
                     for d in available],
         "archive": info,
         "matchesArchive": matches_archive(one["udid"], meta) if one else None,
-        "leases": [status_lease(l, present, holders) for l in leases],
+        "leases": [status_lease(l, present) for l in leases],
         "bootedByLease": read_boot_record(name),
         "lock": {"held": holder is not None, "holder": holder},
         "posterMB": poster_kb(one["udid"]) // 1024 if one else None,
@@ -1812,8 +1889,8 @@ def gc(dry_run=False, leases_older_than=86400, prefix=None):
                 out.append((owner.get("name"), path))
         return out
 
-    def reap_gc_leases(name):
-        live, dead = reap_held_leases(name, dry_run)
+    def reap_gc_leases(directory, snapshot=None):
+        live, dead = reap_held_leases(directory, dry_run, snapshot=snapshot)
         if not dry_run:
             for lease in dead:
                 deleted.append({"kind": "held-lease", "what": held_label(lease)})
@@ -1834,7 +1911,7 @@ def gc(dry_run=False, leases_older_than=86400, prefix=None):
         # Holding the lock means no restore of this name is running (its children keep the
         # lock too), so what is left is a leftover whatever the recorded pid says.
         try:
-            if reap_gc_leases(name):
+            if reap_gc_leases(lease_dir(name)):
                 continue
             for device in all_devices():
                 if device["name"].startswith(name + RESTORING):
@@ -1913,7 +1990,7 @@ def gc(dry_run=False, leases_older_than=86400, prefix=None):
                 attention.append({"kind": "partial", "what": path, "note": "lock held"})
                 continue
             try:
-                if reap_gc_leases(name):
+                if reap_gc_leases(lease_dir(name)):
                     continue
                 # Judge again under the lock: a park may have run between the first look
                 # and the lock, replacing this file or making it the one that pairs.
@@ -1942,27 +2019,41 @@ def gc(dry_run=False, leases_older_than=86400, prefix=None):
         present = {d["udid"] for d in devices}
         names_by_key = {safe_key(d["name"]): d["name"] for d in devices}
         names_by_key.update((safe_key(name), name) for name in names)
+
+        def real_name(key, leases):
+            if key in names_by_key:
+                return names_by_key[key]
+            return next((l["name"] for l in leases if isinstance(l.get("name"), str)
+                         and safe_key(l["name"]) == key), None)
+
         for key in sorted(os.listdir(LEASE_DIR)):
             directory = os.path.join(LEASE_DIR, key)
             # Finder's .DS_Store and the like; a directory removed meanwhile is skipped too.
             entries = lease_entries(directory)
-            name = names_by_key.get(key)
-            if not prefix or wanted(name) or key.startswith(safe_key(prefix)[:len(prefix)]):
-                leases = read_lease_files(directory, entries, quiet=True)
+            leases = read_lease_files(directory, entries, quiet=True)
+            name = real_name(key, leases)
+            key_matches = bool(prefix and key.startswith(safe_key(prefix)[:len(prefix)]))
+            if wanted(name) or key_matches:
                 held = scan_held_leases(directory, entries, leases)
-                if not dry_run and name and any(not l["alive"] for l in held):
-                    lock = try_lock(name)
+                if not dry_run and wanted(name) and any(not l["alive"] for l in held):
+                    lock = try_lock(name, key=key)
                     if lock is not None:
                         try:
-                            held = reap_gc_leases(name)
+                            snapshot = lease_snapshot(directory, quiet=True)
+                            name = real_name(key, snapshot[0])
+                            held = snapshot[1]
+                            if wanted(name):
+                                held = reap_gc_leases(directory, snapshot)
                         finally:
                             lock.__exit__(None, None, None)
-                holders = held_holders(held)
                 for lease in held:
-                    note_text = (describe_held(lease, holders[lease["lockFile"]])
+                    holder = verified_held_holder(lease)
+                    note_text = (describe_held(lease, holder)
                                  if lease["alive"] else f"{held_label(lease)} is dead")
-                    attention.append({"kind": "held-lease", "what": note_text,
-                                      "device": name or key})
+                    item = {"kind": "held-lease", "what": note_text, "device": name or key}
+                    if lease["alive"] and not (holder or lease.get("unreadable")):
+                        item["note"] = held_candidate_hint(lease)
+                    attention.append(item)
             for entry in entries:
                 if entry.startswith("_") or not entry.endswith(".json"):
                     continue
@@ -1979,8 +2070,7 @@ def gc(dry_run=False, leases_older_than=86400, prefix=None):
                     continue
                 name = next((d["name"] for d in devices if d["udid"] == lease.get("udid")),
                             None)
-                if prefix and not (wanted(name) or key.startswith(safe_key(prefix)[:len(
-                        prefix)])):
+                if prefix and not (wanted(name) or key_matches):
                     continue
                 if lease.get("udid") not in present or age > leases_older_than:
                     attention.append({"kind": "lease", "what": lease.get("owner"),
@@ -2186,6 +2276,10 @@ def main():
                     log(f"lease {lease['owner']}: {lease['kind']} alive={lease['alive']} "
                         f"ageSeconds={lease['ageSeconds']} overdue={lease['overdue']} "
                         f"stale={lease['stale']}{holders}")
+                    if lease.get("unreadable"):
+                        log(f"warning: unreadable held lease {lease['owner']}: {lease['unreadable']}")
+                    elif lease.get("holderHint"):
+                        log(lease["holderHint"])
         elif args.command == "ensure":
             result = ensure(args.name, args.create, args.boot, args.lease, args.exclusive,
                             args.wait, args.deny_other_leases, args.allow_lease)

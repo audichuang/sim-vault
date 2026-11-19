@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 import select
-import shutil
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -34,6 +34,12 @@ class HeldLeaseTests(SimVaultCase):
     def js(self, *args):
         proc = self.sv(*args, "--json")
         return proc.returncode, json.loads(proc.stdout)
+
+    def helper_loader(self, snippet):
+        path = Path(self.base) / "held-helper.py"
+        setup = Path(self.loader).read_text().removesuffix("mod.main()\n")
+        path.write_text(setup + textwrap.dedent(snippet))
+        return path
 
     @contextmanager
     def holder(self, udid, mode="exclusive", *, metadata=True):
@@ -70,11 +76,9 @@ with open(sys.argv[1], "a") as lock:
         self.assertEqual((rc, result.get("kind")), (8, "busy"), result)
         self.assertIn("held lease", result["message"])
         self.assertIn(OWNER_KEY[:8] if orphan else OWNER, result["message"])
-        if shutil.which("lsof") or Path("/usr/sbin/lsof").is_file():
-            self.assertRegex(result["message"], rf"pid {child.pid} \([^)]+\)")
-            self.assertIn(f"kill {child.pid}", result["next"])
-        else:
-            self.assertIn("another process", result["message"])
+        self.assertIn("inherited", result["message"])
+        self.assertIn(f"lsof {shlex.quote(str(self.lock_file))}", result["next"])
+        self.assertNotIn(f"kill {child.pid}", result["next"])
         self.assertIn("once", result["next"])
         self.assertIn("exits", result["next"])
 
@@ -87,7 +91,6 @@ with open(sys.argv[1], "a") as lock:
         self.assertEqual(self.js("ensure", NAME, "--boot", "--lease", "manual")[0], 0)
         with self.holder(udid) as child:
             for args in (("park", NAME, "--shutdown"), ("shutdown", NAME),
-                         ("release", NAME, "--lease", "manual", "--shutdown"),
                          ("ensure", NAME, "--lease", "other")):
                 with self.subTest(args=args):
                     self.assert_busy(args, child)
@@ -185,8 +188,7 @@ with open(sys.argv[1], "a") as lock:
             self.assertEqual((lease.get("kind"), lease.get("alive"), lease.get("overdue")),
                              ("held", True, False))
             self.assertGreaterEqual(lease["ageSeconds"], 0)
-            if shutil.which("lsof") or Path("/usr/sbin/lsof").is_file():
-                self.assertIn(child.pid, lease["holderPids"])
+            self.assertEqual(lease["holderPids"], [])
         dead, = self.js("status", NAME)[1]["leases"]
         self.assertEqual((dead.get("alive"), dead.get("stale"), dead.get("holderPids")),
                          (False, True, []))
@@ -315,3 +317,241 @@ with open(sys.argv[1], "a") as lock:
         self.assertIn("--trim-posterboard", self.sv("park", "--help").stdout)
         self.assertIn("--busy-lock", self.sv("shutdown", "--help").stdout)
         self.assertIn("Held leases", self.sv("--help").stdout)
+
+    def test_reap_never_transfers_boot_duty_across_rename_and_reuse(self):
+        original = self.create(NAME)
+        self.assertEqual(self.js("ensure", NAME, "--boot", "--lease", OWNER)[0], 0)
+        with self.holder(original, mode="shared"):
+            self.assertEqual(self.js("ensure", NAME, "--lease", "original-app")[0], 0)
+            self.xcrun("rename", original, NAME + " renamed")
+            replacement = self.create(NAME)
+            self.assertEqual(self.js("ensure", NAME, "--lease", "replacement-app")[0], 0)
+        self.assertEqual(self.js("restore", NAME)[0], 0)
+        boot = json.loads(self.boot_record.read_text())
+        self.assertEqual((boot["udid"], boot["by"]), (original, ["original-app"]))
+        for owner in ("original-app", "replacement-app"):
+            rc, result = self.js("release", NAME, "--lease", owner, "--shutdown")
+            self.assertEqual((rc, result.get("shutdown")), (0, False), result)
+        self.assertEqual((self.state(original), self.state(replacement)), ("Booted", "Shutdown"))
+        self.assert_no_shutdown()
+
+    def test_writer_can_publish_while_passive_probe_holds_shared_lock(self):
+        udid = self.create(NAME)
+        loader = self.helper_loader("""
+            import fcntl
+            name, owner, udid, preexisting = sys.argv[1:]
+            path = mod.held_lock_path(mod.lease_path(name, owner))
+            original_flock = fcntl.flock
+            probe = None
+            def concurrent_probe(fd, operation):
+                global probe
+                if operation & fcntl.LOCK_EX and probe is None and os.path.exists(path):
+                    probe = open(path, "rb")
+                    original_flock(probe, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return original_flock(fd, operation)
+            with mod.DeviceLock(name):
+                if preexisting == "yes":
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    open(path, "a").close()
+                    probe = open(path, "rb")
+                    original_flock(probe, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                fcntl.flock = concurrent_probe
+                fd = mod.write_held_lease(name, owner, udid, "exclusive")
+                try:
+                    assert os.fstat(fd).st_ino == os.stat(path).st_ino
+                    if probe is not None:
+                        assert os.fstat(probe.fileno()).st_ino != os.stat(path).st_ino
+                finally:
+                    os.close(fd)
+                    if probe is not None:
+                        probe.close()
+            """)
+        for preexisting in ("no", "yes"):
+            with self.subTest(preexisting=preexisting):
+                result = subprocess.run([PY, loader, NAME, OWNER, udid, preexisting],
+                                        env=self.env(), capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(set(self.directory.iterdir()), {self.lease_file, self.lock_file})
+                self.lease_file.unlink()
+                self.lock_file.unlink()
+
+    def test_diagnostics_verify_recorded_process_and_ignore_open_file_observers(self):
+        udid = self.create(NAME)
+        # Model lsof returning the process that opened the file without flock. The test
+        # process keeps that fd open while the writer child holds the actual lock.
+        lsof = Path(self.stub) / "lsof"
+        invoked = Path(self.fake) / "lsof-invoked"
+        lsof.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(invoked))}\n"
+                        f"printf '%s\\n' p{os.getpid()} cobserver "
+                        f"{shlex.quote('n' + str(self.lock_file.resolve()))}\n")
+        lsof.chmod(0o755)
+        loader = self.helper_loader("""
+            name, owner, udid = sys.argv[1:]
+            with mod.DeviceLock(name):
+                fd = mod.write_held_lease(name, owner, udid, "exclusive")
+            print("ready", flush=True)
+            sys.stdin.read()
+            os.close(fd)
+            """)
+        with subprocess.Popen([PY, loader, NAME, OWNER, udid], env=self.env(),
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+            try:
+                self.assertTrue(select.select([child.stdout], [], [], 20)[0])
+                self.assertEqual(child.stdout.readline().strip(), "ready")
+                with self.lock_file.open("rb"):
+                    lease, = self.js("status", NAME)[1]["leases"]
+                    self.assertEqual(lease["holderPids"], [child.pid])
+                    rc, result = self.js("shutdown", NAME)
+                    self.assertEqual((rc, result["kind"]), (8, "busy"))
+                    self.assertRegex(result["message"], rf"pid {child.pid} \([^)]+\)")
+                    self.assertIn(f"kill {child.pid}", result["next"])
+                    for start_time in (1, None):
+                        with self.subTest(pidStartedAt=start_time):
+                            record = json.loads(self.lease_file.read_text())
+                            record["pidStartedAt"] = start_time
+                            self.lease_file.write_text(json.dumps(record))
+                            self.assert_busy(("shutdown", NAME), child)
+                            lease, = self.js("status", NAME)[1]["leases"]
+                            self.assertEqual(lease["holderPids"], [])
+                    self.assertFalse(invoked.exists())
+            finally:
+                child.stdin.close()
+                child.wait(timeout=20)
+
+    def test_gc_prefix_uses_real_name_for_deletion(self):
+        udid = self.create(NAME)
+        with self.holder(udid):
+            pass
+        # Both prefixes sanitize to the same key prefix, but only one matches NAME.
+        rc, result = self.js("gc", "--name-prefix", "SVTEST_held")
+        self.assertEqual(rc, 0, result)
+        self.assertEqual(result["deleted"], [])
+        self.assertTrue(self.lease_file.exists())
+        self.assertTrue(self.lock_file.exists())
+        self.xcrun("delete", udid)
+        rc, result = self.js("gc", "--name-prefix", NAME)
+        self.assertEqual(rc, 0, result)
+        self.assertTrue(self.lease_file.exists(), "key-only match is for listing")
+        data = json.loads(self.lease_file.read_text())
+        self.lease_file.write_text(json.dumps(dict(data, name=NAME)))
+        self.assertEqual(self.js("gc", "--name-prefix", NAME)[0], 0)
+        self.assertFalse(self.lease_file.exists(), "JSON supplies the real name")
+        self.assertFalse(self.lock_file.exists())
+
+    def test_release_shutdown_releases_own_lease_with_other_held_lease(self):
+        udid = self.create(NAME)
+        self.assertEqual(self.js("ensure", NAME, "--boot", "--lease", "manual")[0], 0)
+        path = self.directory / (hashlib.sha1(b"manual").hexdigest() + ".json")
+        with self.holder(udid):
+            rc, result = self.js("release", NAME, "--lease", "manual", "--shutdown")
+            self.assertEqual((rc, result.get("action"), result.get("shutdown")),
+                             (0, "released", False), result)
+            self.assertFalse(path.exists())
+            self.assertTrue(self.lease_file.exists())
+            self.assertEqual(json.loads(self.boot_record.read_text())["by"], [OWNER])
+            self.assertEqual(self.state(udid), "Booted")
+        self.assert_no_shutdown()
+
+    def test_gc_reaps_absent_devices_by_key_under_device_lock(self):
+        udid = self.create(NAME)
+        with self.holder(udid):
+            pass
+        self.xcrun("delete", udid)
+        lock_path = self.directory.parent.parent / "locks" / (KEY + ".lock")
+        lock_path.parent.mkdir(exist_ok=True)
+        with lock_path.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(self.js("gc")[0], 0)
+            self.assertTrue(self.lease_file.exists())
+            self.assertTrue(self.lock_file.exists())
+        rc, result = self.js("gc")
+        self.assertEqual(rc, 0, result)
+        self.assertFalse(self.lease_file.exists())
+        self.assertFalse(self.lock_file.exists())
+
+    def test_unreadable_held_lock_fails_decisions_and_survives_passive_scans(self):
+        udid = self.create(NAME)
+        self.assertEqual(self.js("ensure", NAME, "--boot", "--lease", "manual")[0], 0)
+        with self.holder(udid, mode="shared"):
+            pass
+        self.lock_file.chmod(0)
+        for args in (("park", NAME), ("shutdown", NAME),
+                     ("release", NAME, "--lease", "manual", "--shutdown"),
+                     ("ensure", NAME, "--lease", "other", "--exclusive"),
+                     ("ensure", NAME, "--lease", "other", "--deny-other-leases")):
+            with self.subTest(args=args):
+                rc, result = self.js(*args)
+                self.assertEqual((rc, result.get("kind")), (1, "lease-unreadable"), result)
+        rc, result = self.js("status", NAME)
+        self.assertEqual(rc, 0, result)
+        lease, = (lease for lease in result["leases"] if lease["owner"] == OWNER)
+        self.assertEqual((lease["alive"], lease["stale"], lease["holderPids"]), (True, False, []))
+        self.assertIn("Permission denied", lease["unreadable"])
+        rc, result = self.js("gc")
+        self.assertEqual(rc, 0, result)
+        self.assertIn("unreadable", json.dumps(result["attention"]))
+        self.assertTrue(self.lease_file.exists())
+        self.assertTrue(self.lock_file.exists())
+        self.assert_no_shutdown()
+
+    def test_status_shared_probe_ignores_other_shared_probe(self):
+        udid = self.create(NAME)
+        with self.holder(udid):
+            pass
+        with self.lock_file.open("rb") as probe:
+            fcntl.flock(probe, fcntl.LOCK_SH)
+            rc, result = self.js("status", NAME)
+            self.assertEqual(rc, 0, result)
+            lease, = result["leases"]
+            self.assertEqual((lease["alive"], lease["stale"]), (False, True))
+        self.assertTrue(self.lease_file.exists())
+
+    def test_shared_held_lease_survives_gone_udid_in_ensure_and_release(self):
+        udid = self.create(NAME)
+        with self.holder(udid, mode="shared"):
+            original = self.lease_file.read_bytes()
+            self.xcrun("delete", udid)
+            rc, result = self.js("ensure", NAME, "--create", "iPhone 18 Pro Max", "--lease", "other")
+            self.assertEqual((rc, result.get("action")), (0, "created"), result)
+            self.assertTrue(self.lease_file.exists())
+            rc, result = self.js("release", NAME, "--lease", "other")
+            self.assertEqual((rc, result.get("action")), (0, "released"), result)
+            self.assertEqual(self.lease_file.read_bytes(), original)
+            self.assertTrue(self.lock_file.exists())
+
+    def test_reap_preserves_boot_record_if_legacy_lease_is_unreadable(self):
+        udid = self.create(NAME)
+        self.assertEqual(self.js("ensure", NAME, "--boot", "--lease", OWNER)[0], 0)
+        with self.holder(udid):
+            pass
+        bad = self.directory / (hashlib.sha1(b"legacy").hexdigest() + ".json")
+        bad.write_text("{broken")
+        original = self.boot_record.read_bytes()
+        self.assertEqual(self.js("restore", NAME)[0], 0)
+        self.assertTrue(self.boot_record.is_file(), "unreadable owner may still need its record")
+        self.assertEqual(self.boot_record.read_bytes(), original)
+        self.assertFalse(self.lease_file.exists())
+        self.assertFalse(self.lock_file.exists())
+
+    def test_gc_reports_distinct_lock_paths_that_share_a_symlink_target(self):
+        udid = self.create(NAME)
+        self.directory.mkdir(parents=True)
+        target = Path(self.base) / "external-lock"
+        self.lock_file.symlink_to(target)
+        alias = self.directory / "alias.lock"
+        alias.symlink_to(target)
+        with self.holder(udid):
+            rc, result = self.js("gc")
+            self.assertEqual(rc, 0, result)
+            held = [entry["what"] for entry in result["attention"] if entry["kind"] == "held-lease"]
+            self.assertEqual(len(held), 2, held)
+            self.assertIn("held lease alias.lo", "\n".join(held))
+
+    def test_status_reports_age_as_integer_seconds(self):
+        udid = self.create(NAME)
+        with self.holder(udid):
+            rc, result = self.js("status", NAME)
+            self.assertEqual(rc, 0, result)
+            lease, = result["leases"]
+            self.assertIsInstance(lease["ageSeconds"], int)
+            self.assertRegex(self.sv("status", NAME).stderr, r"ageSeconds=\d+ overdue=")
