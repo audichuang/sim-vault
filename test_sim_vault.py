@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import plistlib
+import re
 import shutil
 import signal
 import subprocess
@@ -277,6 +278,26 @@ if os.environ.get("SV_TEST_NOCACHE_LOG") or os.environ.get("SV_TEST_NOCACHE_FAIL
                                         "offset": os.lseek(fd, 0, os.SEEK_CUR)}) + "\n")
             return real_fcntl.fcntl(fd, cmd, arg)
     mod.fcntl = FcntlProxy()
+if os.environ.get("SV_TEST_RAISE_IN"):
+    def boom(*a, **k):
+        raise RuntimeError("injected")
+    setattr(mod, os.environ["SV_TEST_RAISE_IN"], boom)
+if os.environ.get("SV_TEST_HISTORY_LOCK_TIMEOUT"):
+    mod.HISTORY_LOCK_TIMEOUT = float(os.environ["SV_TEST_HISTORY_LOCK_TIMEOUT"])
+if os.environ.get("SV_TEST_GC_HOOK"):
+    # Run a command once, after gc's first look and before it takes the first lock.
+    import json, subprocess
+    real_try_lock = mod.try_lock
+    hook_done = []
+    def try_lock(name):
+        if not hook_done:
+            hook_done.append(1)
+            env = dict(os.environ)
+            env.pop("SV_TEST_GC_HOOK")
+            subprocess.run(json.loads(os.environ["SV_TEST_GC_HOOK"]), env=env,
+                           capture_output=True)
+        return real_try_lock(name)
+    mod.try_lock = try_lock
 if os.environ.get("SV_TEST_LEASE_VANISHES"):
     # A release deleting a lease between gc's listing and its lstat.
     real_lstat = os.lstat
@@ -419,6 +440,14 @@ class SimVaultCase(unittest.TestCase):
         r = self.sv("park", name)
         self.assertEqual(r.returncode, 0, r.stderr)
         return udid
+
+    def partials(self, ext, name="SVTEST a"):
+        """This name's .partial files of one kind (park adds a per-run token)."""
+        if not os.path.isdir(self.vault):
+            return []
+        pat = re.compile(re.escape(name) + r"\." + ext + r"(\.\d+-[0-9a-f]+)?\.partial")
+        return sorted(os.path.join(self.vault, f) for f in os.listdir(self.vault)
+                      if pat.fullmatch(f))
 
     def assert_no_partials(self):
         if os.path.isdir(self.vault):
@@ -633,7 +662,7 @@ class T1Core(SimVaultCase):
         new = self.sv("restore", "SVTEST a").stdout.strip()
         sha = self.tar_sha("SVTEST a")
         p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=30)
-        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        self.wait_for(lambda: self.partials("tar"))
         p.send_signal(signal.SIGTERM)
         _out, err = p.communicate(timeout=30)
         self.assertEqual(p.returncode, 128 + signal.SIGTERM, err)
@@ -703,7 +732,7 @@ class T1Core(SimVaultCase):
     def test_tar_keeps_lock_after_parent_dies(self):
         self.create("SVTEST a")
         p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=4)
-        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        self.wait_for(lambda: self.partials("tar"))
         p.kill()
         p.wait(timeout=30)   # not communicate(): tar holds the same stderr pipe
         p.stdout.close()
@@ -972,7 +1001,7 @@ class T2SharedLayer(SimVaultCase):
             rc, d = self.js("park", "SVTEST a", "--busy-lock", tmpl)
             self.assertEqual(rc, 8)
         p = self.spawn("park", "SVTEST a", "--busy-lock", tmpl, FAKE_TAR_SLEEP=3)
-        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        self.wait_for(lambda: self.partials("tar"))
         with open(path) as h:
             with self.assertRaises(BlockingIOError):
                 fcntl.flock(h, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1159,7 +1188,7 @@ class T3Review(SimVaultCase):
         tmpl = os.path.join(self.base, "hl-{udid}.lock")
         path = tmpl.replace("{udid}", udid)
         p = self.spawn("park", "SVTEST a", "--busy-lock", tmpl, FAKE_TAR_SLEEP=3)
-        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        self.wait_for(lambda: self.partials("tar"))
         self.assertTrue(os.path.exists(path))
         with open(path) as h:
             with self.assertRaises(BlockingIOError):
@@ -1273,7 +1302,7 @@ class T3Review(SimVaultCase):
     def test_r7_second_signal_ignored_during_cleanup(self):
         self.create("SVTEST a")
         p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=30, SV_TEST_SLOW_REMOVE=1)
-        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        self.wait_for(lambda: self.partials("tar"))
         p.send_signal(signal.SIGTERM)
         time.sleep(0.5)
         p.send_signal(signal.SIGHUP)
@@ -1284,7 +1313,7 @@ class T3Review(SimVaultCase):
     def test_r7_failed_cleanup_is_reported(self):
         self.create("SVTEST a")
         p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=30, SV_TEST_FAIL_REMOVE=1)
-        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        self.wait_for(lambda: self.partials("tar"))
         p.send_signal(signal.SIGTERM)
         _o, err = p.communicate(timeout=30)
         self.assertEqual(p.returncode, 128 + signal.SIGTERM, err)
@@ -1305,7 +1334,7 @@ class T3Review(SimVaultCase):
     def test_r8_dead_holder_message(self):
         self.create("SVTEST a")
         p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=4)
-        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        self.wait_for(lambda: self.partials("tar"))
         p.kill()
         p.wait(timeout=30)
         p.stdout.close()
@@ -1343,7 +1372,7 @@ class T3Review(SimVaultCase):
     def test_q4_sigint_then_sigterm_does_not_cut_cleanup(self):
         self.create("SVTEST a")
         p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=30, SV_TEST_SLOW_REMOVE=1)
-        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        self.wait_for(lambda: self.partials("tar"))
         p.send_signal(signal.SIGINT)
         time.sleep(0.5)
         p.send_signal(signal.SIGTERM)
@@ -1359,7 +1388,7 @@ class T3Review(SimVaultCase):
                     SV_TEST_CORRUPT_TAR_AFTER_REPLACE=1)
         self.assertEqual(r.returncode, 143, r.stderr)
         self.assertEqual(self.meta("SVTEST a"), old)
-        self.assertTrue(os.path.exists(os.path.join(self.vault, "SVTEST a.json.partial")))
+        self.assertEqual(len(self.partials("json")), 1)
 
     def test_q7_one_retry_when_only_written_during_archive(self):
         self.parked("SVTEST a")
@@ -1501,7 +1530,7 @@ class T4V3(SimVaultCase):
         self.assertEqual(rc, 0)
         calls = self.nocache_calls()
         self.assertEqual([(c["arg"], c["offset"]) for c in calls], [(1, 0)])
-        self.assertTrue(calls[0]["path"].endswith("/SVTEST a.tar.partial"), calls)
+        self.assertRegex(calls[0]["path"], r"/SVTEST a\.tar\.\d+-[0-9a-f]+\.partial$")
         os.remove(self.nocache_log())
         rc, _ = self.js("restore", "SVTEST a", SV_TEST_NOCACHE_LOG=self.nocache_log())
         self.assertEqual(rc, 0)
@@ -1587,16 +1616,15 @@ class T4V3(SimVaultCase):
         self.create("SVTEST a")
         sigs = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
         for sig in sigs:
-            partial = os.path.join(self.vault, "SVTEST a.tar.partial")
             p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=30)
-            self.wait_for(lambda: os.path.exists(partial))
+            self.wait_for(lambda: self.partials("tar"))
             p.send_signal(sig)
             _o, err = p.communicate(timeout=30)
             self.assertEqual(p.returncode, 128 + sig, err)
             self.assertIn(f"error (exit {128 + sig}, interrupted): interrupted by "
                           f"signal {sig}; cleaned up", err)
             self.assertIn("next: rerun", err)
-            self.wait_for(lambda: not os.path.exists(partial))
+            self.wait_for(lambda: not self.partials("tar"))
         h = self.history()
         self.assertEqual([(x["cmd"], x["rc"], x["kind"]) for x in h],
                          [("park", 128 + sig, "interrupted") for sig in sigs])
@@ -1652,15 +1680,10 @@ class T4V3(SimVaultCase):
         self.assertIn("sim-vault: next: ", r.stderr)
         r = self.sv("park")
         self.assertIn("error (exit 2, usage): ", r.stderr)
-        # An unexpected exception: a lease file holding a list instead of an object.
-        import hashlib as hl
+        # An unexpected exception (injected).
         name = "SVTEST a"
         self.create(name)
-        key = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:60]
-        key += "-" + hl.sha1(name.encode()).hexdigest()[:8]
-        os.makedirs(os.path.join(self.leases_dir(), key))
-        write(os.path.join(self.leases_dir(), key, "bad.json"), "[1]")
-        r = self.sv("ensure", name)
+        r = self.sv("ensure", name, SV_TEST_RAISE_IN="restore_locked")
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn("error (exit 1, unexpected): unexpected ", r.stderr)
         self.assertIn("next: stop and report this message", r.stderr)
@@ -1805,7 +1828,7 @@ class T4V3(SimVaultCase):
             self.assertEqual(rc, 8)
         self.assertEqual(self.state(udid), "Booted")
         p = self.spawn("park", "SVTEST a", "--shutdown", FAKE_TAR_SLEEP=3)
-        self.wait_for(lambda: os.path.exists(os.path.join(self.vault, "SVTEST a.tar.partial")))
+        self.wait_for(lambda: self.partials("tar"))
         rc, d = self.js("shutdown", "SVTEST a", "--wait", "0.5")
         self.assertEqual(rc, 8)
         _o, err = p.communicate(timeout=60)
@@ -1823,9 +1846,9 @@ class T4V3(SimVaultCase):
         self.assertEqual([d["UDID"] for d in self.devices("SVTEST a")], [new])
         self.assertEqual(self.meta("SVTEST a"), old)                  # old metadata ...
         self.assertNotEqual(old["sha256"], self.tar_sha("SVTEST a"))  # ... new tar
-        partial = os.path.join(self.vault, "SVTEST a.json.partial")
-        self.assertTrue(os.path.exists(partial))
-        return new, partial
+        found = self.partials("json")
+        self.assertEqual(len(found), 1)
+        return new, found[0]
 
     def test_killed_park_partial_survives_gc_and_restore_pairs_it(self):
         new, partial = self.killed_between_renames()
@@ -1865,6 +1888,189 @@ class T4V3(SimVaultCase):
         self.assertEqual((rc, d["action"]), (0, "existing"))
         self.assertTrue(os.path.exists(partial))
         self.assertEqual(self.meta("SVTEST a"), old)
+
+    # -- review round (Codex) ------------------------------------------------------------
+    def test_retry_with_unreadable_tar_keeps_pending_metadata(self):
+        new, partial = self.killed_between_renames()
+        old = self.meta("SVTEST a")
+        tar_sha = self.tar_sha("SVTEST a")
+        rc, d = self.js("park", "SVTEST a", SV_TEST_NOCACHE_FAIL=1)
+        self.assertEqual((rc, d["kind"]), (1, "pending-pair"))
+        self.assertEqual(self.partials("json"), [partial])        # not cleaned away
+        self.assertEqual((self.meta("SVTEST a"), self.tar_sha("SVTEST a")), (old, tar_sha))
+        self.assertEqual([x["UDID"] for x in self.devices("SVTEST a")], [new])
+        self.assertEqual(self.partials("tar"), [])
+        rc, d = self.js("park", "SVTEST a")                       # vault reads fine again
+        self.assertEqual((rc, d["action"]), (0, "parked"))
+        self.assertEqual(self.meta("SVTEST a")["sha256"], self.tar_sha("SVTEST a"))
+        self.assert_no_partials()
+
+    def test_mismatched_pending_blocks_park(self):
+        new, partial = self.killed_between_renames()
+        with open(partial) as h:
+            data = json.load(h)
+        data["sha256"] = "0" * 64
+        with open(partial, "w") as h:
+            json.dump(data, h)
+        tar_sha = self.tar_sha("SVTEST a")
+        rc, d = self.js("park", "SVTEST a")
+        self.assertEqual((rc, d["kind"]), (1, "pending-pair"))
+        self.assertEqual((self.partials("json"), self.tar_sha("SVTEST a")), ([partial], tar_sha))
+        self.assertEqual(len(self.devices("SVTEST a")), 1)
+
+    def test_stale_metadata_partial_removed_once_paired(self):
+        self.parked("SVTEST a")
+        stale = os.path.join(self.vault, "SVTEST a.json.1-abcdef.partial")
+        write(stale, json.dumps({"udid": "x", "sha256": "0" * 64}))
+        self.sv("restore", "SVTEST a")
+        self.assertFalse(os.path.exists(stale))
+        self.assertEqual(self.meta("SVTEST a")["sha256"], self.tar_sha("SVTEST a"))
+
+    def test_each_park_run_cleans_only_its_own_partials(self):
+        self.create("SVTEST a")
+        other = os.path.join(self.vault, "SVTEST a.tar.1-abcdef.partial")
+        os.makedirs(self.vault, exist_ok=True)
+        write(other, "someone else's")
+        p = self.spawn("park", "SVTEST a", FAKE_TAR_SLEEP=30)
+        self.wait_for(lambda: len(self.partials("tar")) == 2)
+        p.send_signal(signal.SIGTERM)
+        _o, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 128 + signal.SIGTERM, err)
+        self.assertEqual(self.partials("tar"), [other])
+
+    def test_gc_rechecks_under_lock_after_interrupted_park(self):
+        self.parked("SVTEST a")
+        new = self.sv("restore", "SVTEST a").stdout.strip()
+        old_partial = os.path.join(self.vault, "SVTEST a.tar.partial")      # v2 leftover
+        write(old_partial, "x")
+        os.utime(old_partial, (time.time() - 7200, time.time() - 7200))
+        hook = json.dumps([PY, self.loader, "park", "SVTEST a"])
+        rc, d = self.js("gc", "--name-prefix", "SVTEST", SV_TEST_GC_HOOK=hook,
+                        SV_TEST_EXIT_AFTER_TAR_REPLACE=1)
+        self.assertEqual(rc, 0, d)
+        pending = self.partials("json")
+        self.assertEqual(len(pending), 1)                    # the interrupted park's metadata
+        self.assertNotIn(pending[0], [x["what"] for x in d["deleted"]])
+        rc, d = self.js("restore", "SVTEST a")
+        self.assertEqual((rc, d["action"], d["udid"]), (0, "existing", new))
+        self.assertEqual(self.meta("SVTEST a")["sha256"], self.tar_sha("SVTEST a"))
+
+    def test_gc_keeps_partial_replaced_while_waiting_for_lock(self):
+        self.parked("SVTEST a")
+        old_partial = os.path.join(self.vault, "SVTEST a.tar.partial")
+        write(old_partial, "x")
+        os.utime(old_partial, (time.time() - 7200, time.time() - 7200))
+        code = (f"import os; p={old_partial!r}; os.remove(p); open(p, 'w').write('new'); "
+                "os.utime(p, (0, 0))")              # replaced, and still looks old
+        rc, d = self.js("gc", "--name-prefix", "SVTEST",
+                        SV_TEST_GC_HOOK=json.dumps([PY, "-c", code]))
+        self.assertEqual((rc, d["deleted"]), (0, []))
+        self.assertIn("changed while gc waited", str(d["attention"]))
+        with open(old_partial) as h:
+            self.assertEqual(h.read(), "new")
+
+    def lease_files(self):
+        out = []
+        for root, _dirs, files in os.walk(self.leases_dir()):
+            out += [os.path.join(root, f) for f in files if not f.startswith("_")]
+        return out
+
+    def test_unreadable_lease_stops_shutdown_and_park(self):
+        udid = self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--boot", "--lease", "A")[0], 0)
+        lease = self.lease_files()[0]
+        os.chmod(lease, 0)
+        try:
+            rc, d = self.js("shutdown", "SVTEST a")
+            self.assertEqual((rc, d["kind"]), (1, "lease-unreadable"))
+            self.assertEqual(self.state(udid), "Booted")
+            rc, d = self.js("park", "SVTEST a", "--shutdown")
+            self.assertEqual((rc, d["kind"]), (1, "lease-unreadable"))
+            self.assertEqual(self.state(udid), "Booted")
+        finally:
+            os.chmod(lease, 0o644)
+        write(lease, "{not json")
+        self.assertEqual(self.js("shutdown", "SVTEST a")[1]["kind"], "lease-unreadable")
+        write(lease, "[1]")
+        self.assertEqual(self.js("park", "SVTEST a", "--shutdown")[1]["kind"],
+                         "lease-unreadable")
+        self.assertEqual(self.state(udid), "Booted")
+        self.assertEqual(self.count("shutdown"), 0)
+
+    def test_shutdown_rereads_state_after_locks(self):
+        udid = self.create("SVTEST a")
+        # Booted by someone else between shutdown's first look and taking the locks.
+        self.hooks([{"cmd": "list", "n": 2, "action": "state", "device": udid,
+                     "state": "Booted"}])
+        rc, d = self.js("shutdown", "SVTEST a")
+        self.assertEqual((rc, d["action"], d["state"]), (0, "shutdown", "Shutdown"))
+        self.assertEqual(self.state(udid), "Shutdown")
+
+    def test_history_lock_held_does_not_block_exit(self):
+        import fcntl
+        udid = self.create("SVTEST a")
+        path = os.path.join(self.home, "Library/Developer/CoreSimulator/sim-vault/history.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as h:
+            fcntl.flock(h, fcntl.LOCK_EX)
+            started = time.time()
+            r = self.sv("ensure", "SVTEST a", SV_TEST_HISTORY_LOCK_TIMEOUT=0.5)
+            self.assertLess(time.time() - started, 5)
+        self.assertEqual((r.returncode, r.stdout), (0, udid + "\n"))
+        self.assertIn("history lock busy", r.stderr)
+        self.assertEqual(self.history(), [])
+
+    def orphan_tar(self):
+        self.parked("SVTEST a")
+        os.remove(os.path.join(self.vault, "SVTEST a.json"))
+        return self.tar_sha("SVTEST a")
+
+    def test_orphan_tar_is_not_no_archive(self):
+        sha = self.orphan_tar()
+        rc, d = self.js("restore", "SVTEST a")
+        self.assertEqual((rc, d["kind"]), (1, "archive-incomplete"))
+        rc, d = self.js("ensure", "SVTEST a", "--create", "iPhone 18 Pro Max")
+        self.assertEqual((rc, d["kind"]), (1, "archive-incomplete"))
+        self.assertEqual(self.devices(), [])                 # --create did not create
+        self.assertEqual(self.tar_sha("SVTEST a"), sha)
+        self.assertIn("archive-incomplete", str(self.js("status", "SVTEST a")[1]["archive"]))
+
+    def test_park_refuses_to_overwrite_orphan_tar(self):
+        sha = self.orphan_tar()
+        blank = self.create("SVTEST a")
+        rc, d = self.js("park", "SVTEST a")
+        self.assertEqual((rc, d["kind"]), (7, "archive-incomplete"))
+        self.assertEqual(self.tar_sha("SVTEST a"), sha)
+        self.assertEqual([x["UDID"] for x in self.devices("SVTEST a")], [blank])
+        self.assertEqual(self.js("park", "SVTEST a", "--replace")[0], 0)
+        self.assertEqual(self.meta("SVTEST a")["udid"], blank)
+
+    def test_deny_other_leases(self):
+        udid = self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--lease", "manual")[0], 0)
+        rc, d = self.js("ensure", "SVTEST a", "--lease", "test", "--deny-other-leases")
+        self.assertEqual((rc, d["kind"]), (8, "busy"))
+        self.assertIn("manual", d["message"])
+        self.assertEqual(len(self.lease_files()), 1)         # no lease taken
+        rc, d = self.js("ensure", "SVTEST a", "--lease", "test", "--deny-other-leases",
+                        "--allow-lease", "other", "--allow-lease", "manual")
+        self.assertEqual(rc, 0, d)
+        self.assertEqual(len(self.lease_files()), 2)
+        rc, d = self.js("status", "SVTEST a")
+        self.assertEqual({l["mode"] for l in d["leases"]}, {"shared"})
+        # Own lease again: passes.
+        rc, d = self.js("ensure", "SVTEST a", "--lease", "test", "--deny-other-leases",
+                        "--allow-lease", "manual")
+        self.assertEqual(rc, 0, d)
+        self.assertEqual(self.js("release", "SVTEST a", "--lease", "manual")[0], 0)
+        self.assertEqual(self.js("release", "SVTEST a", "--lease", "test")[0], 0)
+        # Running without any lease: passes (not --exclusive).
+        self.patch_device(udid, fakeState="Booted")
+        rc, d = self.js("ensure", "SVTEST a", "--lease", "test", "--deny-other-leases")
+        self.assertEqual((rc, d["state"]), (0, "Booted"))
+        self.assertEqual(self.js("ensure", "SVTEST a", "--deny-other-leases")[0], 2)
+        self.assertEqual(self.js("ensure", "SVTEST a", "--lease", "x", "--allow-lease",
+                                 "y")[0], 2)
 
 
 if __name__ == "__main__":
