@@ -49,7 +49,8 @@ class TestHistoryOverride(SimVaultCase):
     def test_outer_variable_does_not_leak_into_tests(self):
         outer = os.path.join(self.base, "outer.jsonl")
         with mock.patch.dict(os.environ, {"SIM_VAULT_HISTORY": outer}):
-            self.assertNotIn("SIM_VAULT_HISTORY", self.env())
+            self.assertFalse("SIM_VAULT_HISTORY" in self.env(),
+                             "env() passed the outer SIM_VAULT_HISTORY through")
             proc = self.sv("shutdown", "SVTEST none", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(os.path.exists(outer))
