@@ -846,7 +846,8 @@ def partial_token():
 
 def pending_meta_partials(tar_path, meta_path):
     """Metadata .partial files whose park was killed between its two renames: the tar of
-    the same run is in place (its .partial is gone), the metadata is not. Files only."""
+    the same run is in place (its .partial is gone), the metadata is not. Files only.
+    None when the vault cannot be listed: unknown is not the same as "none"."""
     if not os.path.exists(tar_path):
         return []
     vault, base = os.path.split(meta_path)
@@ -854,8 +855,9 @@ def pending_meta_partials(tar_path, meta_path):
     out = []
     try:
         entries = sorted(os.listdir(vault))
-    except OSError:
-        return []
+    except OSError as exc:
+        log(f"warning: cannot list {vault} to look for metadata of an interrupted park: {exc}")
+        return None
     for entry in entries:
         match = PARTIAL_RE.fullmatch(entry)
         if not match or match["stem"] != stem or match["ext"] != "json":
@@ -873,15 +875,21 @@ def settle_pending(tar_path, meta_path):
     tar became the metadata), or "failed" (pending, but none could be checked or matched;
     everything is left as it is)."""
     pending = pending_meta_partials(tar_path, meta_path)
+    if pending is None:
+        return "failed"
     if not pending:
         return "none"
     try:
         actual = file_sha256(tar_path)
         current = read_meta(meta_path)
         if current is not None and current.get("sha256") == actual:
+            # The pair is settled; a stale .partial that cannot be removed is only clutter.
             for path in pending:
                 log(f"removing {path}: the archive is already paired")
-                remove_file(path)
+                try:
+                    remove_file(path)
+                except OSError as exc:
+                    log(f"warning: could not remove {path}: {exc}")
             return "none"
         for path in pending:
             try:
@@ -1165,7 +1173,14 @@ def restore_locked(name, warnings=None):
     except Fail:
         pass   # vault unavailable or a bad name: reported below where it matters
     else:
-        settle_pending(tar_path, meta_path)   # a failure shows up as a checksum mismatch
+        # Unsettled, the metadata in place may describe another device than the tar:
+        # deciding 3/4/10 or creating a device from it would be deciding on stale data.
+        if settle_pending(tar_path, meta_path) == "failed":
+            raise Fail(f"an interrupted park left the tar of '{name}' without matching "
+                       "metadata, and pairing them failed (see the warnings above); nothing "
+                       "was restored or created", kind="pending-pair",
+                       next_step="rerun once the vault reads fine; if it keeps failing, stop "
+                                 "and report it, do not delete the .partial files")
     existing = find_one(name, warnings)
     if existing is not None:
         note(udid=existing["udid"])
@@ -1624,7 +1639,11 @@ def gc(dry_run=False, leases_older_than=86400, prefix=None):
                     return "gone"
                 # A park killed between its renames: this metadata may be the only one that
                 # matches the tar in place. park/restore of the name pair it after checking.
-                if path in pending_meta_partials(tar_path, meta_path):
+                pending = pending_meta_partials(tar_path, meta_path)
+                if pending is None and match["ext"] == "json":
+                    return ("cannot list the vault to tell whether it pairs with the tar in "
+                            "place; not deleted")
+                if pending and path in pending:
                     return ("may belong to the tar in place; the next park or restore of "
                             "this name pairs it; not deleted")
                 if time.time() - st.st_mtime < STALE_AFTER:

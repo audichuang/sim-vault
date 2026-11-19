@@ -278,6 +278,17 @@ if os.environ.get("SV_TEST_NOCACHE_LOG") or os.environ.get("SV_TEST_NOCACHE_FAIL
                                         "offset": os.lseek(fd, 0, os.SEEK_CUR)}) + "\n")
             return real_fcntl.fcntl(fd, cmd, arg)
     mod.fcntl = FcntlProxy()
+if os.environ.get("SV_TEST_LISTDIR_FAIL_FROM"):
+    # EIO on the vault listing from the N-th listdir of the vault on.
+    real_listdir = os.listdir
+    listdir_calls = [0]
+    def listdir(p="."):
+        if os.path.realpath(str(p)) == os.path.realpath(os.environ["SIM_VAULT_DIR"]):
+            listdir_calls[0] += 1
+            if listdir_calls[0] >= int(os.environ["SV_TEST_LISTDIR_FAIL_FROM"]):
+                raise OSError(5, "simulated EIO", p)
+        return real_listdir(p)
+    mod.os.listdir = listdir
 if os.environ.get("SV_TEST_RAISE_IN"):
     def boom(*a, **k):
         raise RuntimeError("injected")
@@ -1885,9 +1896,11 @@ class T4V3(SimVaultCase):
             json.dump(data, h)
         old = self.meta("SVTEST a")
         rc, d = self.js("restore", "SVTEST a")
-        self.assertEqual((rc, d["action"]), (0, "existing"))
+        # Unsettled pair: refused (round-2 F5), everything left as it is.
+        self.assertEqual((rc, d["kind"]), (1, "pending-pair"))
         self.assertTrue(os.path.exists(partial))
         self.assertEqual(self.meta("SVTEST a"), old)
+        self.assertEqual([x["UDID"] for x in self.devices("SVTEST a")], [new])
 
     # -- review round (Codex) ------------------------------------------------------------
     def test_retry_with_unreadable_tar_keeps_pending_metadata(self):
@@ -2108,6 +2121,53 @@ class T4V3(SimVaultCase):
         self.create("SVTEST a")
         rc, d = self.js("ensure", "SVTEST a")
         self.assertEqual((rc, d["action"], d["needsReplaceOnFirstPark"]), (0, "existing", True))
+
+    # -- review round 2 (refuter F5, F6) -------------------------------------------------
+    def foreign_interrupted(self, runtime_a):
+        """Archive of device A; then a different device B parked with --replace, killed
+        between the renames: B's tar is in place, A's metadata still names A."""
+        a = self.create("SVTEST a", runtime=runtime_a)
+        self.assertEqual(self.sv("park", "SVTEST a").returncode, 0)
+        self.xcrun("delete", self.sv("restore", "SVTEST a").stdout.strip())
+        b = self.create("SVTEST a")
+        r = self.sv("park", "SVTEST a", "--replace", SV_TEST_EXIT_AFTER_TAR_REPLACE=1)
+        self.assertEqual(r.returncode, 137, r.stderr)
+        self.assertEqual(self.meta("SVTEST a")["udid"], a)
+        return b
+
+    def test_f5_unsettled_pair_stops_ensure(self):
+        b = self.foreign_interrupted(RT)
+        rc, d = self.js("ensure", "SVTEST a", SV_TEST_NOCACHE_FAIL=1)
+        self.assertEqual((rc, d["kind"]), (1, "pending-pair"))       # not 10 from old metadata
+        rc, d = self.js("ensure", "SVTEST a")
+        self.assertEqual((rc, d["action"], d["udid"]), (0, "existing", b))
+
+    def test_f5_unsettled_pair_does_not_create(self):
+        self.set_runtimes([RT_OLD, RT])
+        b = self.foreign_interrupted(RT_OLD)
+        self.xcrun("delete", b)
+        self.set_runtimes([RT])                  # old metadata's runtime gone: would be 4
+        rc, d = self.js("ensure", "SVTEST a", "--create", "iPhone 18 Pro Max",
+                        SV_TEST_NOCACHE_FAIL=1)
+        self.assertEqual((rc, d["kind"]), (1, "pending-pair"))
+        self.assertEqual(self.devices(), [])
+
+    def test_f6_gc_keeps_partial_when_vault_listing_fails(self):
+        new, partial = self.killed_between_renames()
+        os.utime(partial, (time.time() - 7200, time.time() - 7200))
+        rc, d = self.js("gc", "--name-prefix", "SVTEST", SV_TEST_LISTDIR_FAIL_FROM=2)
+        self.assertEqual((rc, d["deleted"]), (0, []))
+        self.assertTrue(os.path.exists(partial))
+        self.assertIn(partial, [a["what"] for a in d["attention"]])
+
+    def test_f6_park_stops_when_vault_listing_fails(self):
+        new, partial = self.killed_between_renames()
+        old, sha = self.meta("SVTEST a"), self.tar_sha("SVTEST a")
+        rc, d = self.js("park", "SVTEST a", SV_TEST_LISTDIR_FAIL_FROM=1)
+        self.assertEqual((rc, d["kind"]), (1, "pending-pair"))
+        self.assertEqual((self.meta("SVTEST a"), self.tar_sha("SVTEST a")), (old, sha))
+        self.assertEqual(self.partials("json"), [partial])
+        self.assertEqual([x["UDID"] for x in self.devices("SVTEST a")], [new])
 
 
 if __name__ == "__main__":
