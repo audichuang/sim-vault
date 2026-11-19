@@ -12,8 +12,9 @@
 
 ## v3 (2026-11-19)
 
-- Read-back goes to the vault for real: the checksum read after `park`, and during `restore`
-  extraction or pairing of tar/JSON, sets `F_NOCACHE` before the first read. If `park`
+- Read-back is meant to hit the vault: the checksum read after `park`, and during `restore`
+  extraction or pairing of tar/JSON, sets `F_NOCACHE` before the first read (reported by the
+  maintainer; not independently verified at release time). If `park`
   cannot set it, it exits 1 and keeps the device; `restore` only warns (checksum still checked).
 - `history.jsonl` under `~/Library/Developer/CoreSimulator/sim-vault/`: one line per
   ensure/restore/park/release/shutdown call (ts, cmd, name, udid, rc, kind, action, bytes,
@@ -27,7 +28,8 @@
   anchored member paths) by default, prints one line, exits 0, and records
   `posterboardTrimmed`/`excluded` in the metadata. `--keep-posterboard` restores the old
   behaviour (exit 9, device untouched); `--trim-posterboard` is kept as a no-op alias.
-  A trimmed archive restores and boots, PosterBoard rebuilds itself.
+  Reported by the maintainer: a trimmed archive restores and boots, and PosterBoard rebuilds
+  itself (not independently verified at release time).
 - `park --exclude-symbol-cache` (off by default) excludes
   `data/Library/Caches/com.apple.coresymbolicationd`.
 - New subcommand `shutdown <name> [--busy-lock F] [--wait S]`: shuts down under the device
@@ -82,18 +84,6 @@
   together can print a Python traceback; the fake-xcrun counters in tests are occasionally
   flaky under parallel runs.
 
-## v1.2 (2026-11-17)
-
-- `park` measures PosterBoard data first: a bloated store would otherwise be packed whole into
-  the archive.
-
-## v1.1 (2026-11-17)
-
-- Exit 5 (vault not mounted) no longer means "create a fresh device": that could replace an
-  archive holding a login with an empty device. Only 3 and 4 fall back to creating.
-- `restore` records `restoredAs` in the metadata; `park` exits 7 when the archived `udid` and
-  `restoredAs` are both not this device; `--replace` overrides.
-
 ## v1 (2026-11-17)
 
 - `park|restore|list`: pack a whole simulator (apps, logins, keychain) into `$SIM_VAULT_DIR`,
@@ -104,3 +94,9 @@
   the LaunchServices database (delete the csstore so it rebuilds); packing right after
   shutdown can produce a corrupt tar with exit 0 and a matching checksum (wait for the files
   to settle, then verify with `tar -t`).
+- Same day, folded in here (no separate version numbers were recorded):
+  - `park` measures PosterBoard data first: a bloated store would otherwise be packed whole.
+  - Exit 5 (vault not mounted) no longer means "create a fresh device": that could replace an
+    archive holding a login with an empty device. Only 3 and 4 fall back to creating.
+  - `restore` records `restoredAs` in the metadata; `park` exits 7 when the archived `udid`
+    and `restoredAs` are both not this device; `--replace` overrides.

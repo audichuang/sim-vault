@@ -27,12 +27,14 @@ sim-vault --version
 ### Upgrade
 
 ```sh
-uv tool install --force git+https://github.com/audichuang/sim-vault@<tag>
+TAG=v3.1.0   # the tag you want
+uv tool install --force "git+https://github.com/audichuang/sim-vault@$TAG"
 ```
 
 ### Roll back
 
-Install the previous tag the same way (`--force ...@<previous tag>`).
+Install the previous tag the same way (set `TAG` to it). A previous tag exists only from the
+second release on; v3.1.0 is the first.
 
 ## Commands
 
@@ -43,13 +45,19 @@ Install the previous tag the same way (`--force ...@<previous tag>`).
 | `park`    | Archive a simulator to the vault, verify the read-back, then delete the local device |
 | `release` | Give up a lease taken by `ensure --lease` (optionally shut down) |
 | `shutdown`| Shut a device down under its lock |
-| `status`  | Show the local device for a name |
+| `status`  | Show the local device, archive and leases for a name |
 | `list`    | List archives in the vault |
 | `gc`      | Remove what interrupted runs left behind (use `--dry-run` first) |
 
 Every command takes `--json`. `sim-vault --help` is the reference for subcommands, flags,
 environment variables (`SIM_VAULT_DIR`, `SIM_VAULT_HISTORY`) and the exit-code table that
 tells a caller what to do next; `sim-vault <command> --help` has the per-command flags.
+
+## Security
+
+An archive contains the simulator's app data, logins and keychain. Restrict the share that
+holds the archive directory (ACL) so that only your own account can read it. sim-vault
+creates files with the default umask and does not tighten permissions itself.
 
 ## Tests
 
