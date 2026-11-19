@@ -78,7 +78,6 @@ import argparse
 from contextlib import ExitStack
 import ctypes
 from datetime import datetime
-import errno
 import fcntl
 import hashlib
 import json
@@ -128,7 +127,6 @@ STATE_TIMEOUT = 120
 BOOT_TIMEOUT = 300
 POLL = 1.0
 DEFAULT_WAIT = 60
-RUN_GROUP_TIMEOUT = 10
 HELD_RELEASE_TIMEOUT = 5
 RUN_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 STALE_AFTER = 3600
@@ -206,26 +204,38 @@ def cleanup(what, fn):
         log(f"warning: could not {what}: {exc}")
 
 
+def write_stderr(message):
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except BrokenPipeError:
+        # Keep stderr's buffered write from failing again at interpreter exit.
+        with open(os.devnull, "wb") as sink:
+            os.dup2(sink.fileno(), sys.stderr.fileno())
+
+
 def log(message):
-    print(f"sim-vault: {message}", file=sys.stderr, flush=True)
+    write_stderr(f"sim-vault: {message}")
 
 
 def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
-def simctl(*args, device_set=None, timeout=None, keep_lock=False):
+def simctl(*args, device_set=None, timeout=None, keep_lock=False, lease_fd=None):
     """keep_lock: the child inherits the device lock, so if this process dies it keeps
     others out until it finishes. Only for steps whose half-done state others must not
     see (clone, rename, delete, shutdown); boot/bootstatus/list could hold it without
-    bound."""
+    bound. A held lease can protect a boot or bootstatus without the device lock."""
     cmd = ["xcrun", "simctl"]
     if device_set:
         cmd += ["--set", device_set]
     cmd += list(args)
+    pass_fds = tuple(HELD_FDS) if keep_lock else ()
+    if lease_fd is not None:
+        pass_fds += (lease_fd,)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                                pass_fds=tuple(HELD_FDS) if keep_lock else ())
+                                pass_fds=pass_fds)
     except subprocess.TimeoutExpired:
         raise Fail(f"{' '.join(cmd)} did not finish in {timeout}s",
                    next_step="check the device in `xcrun simctl list devices`, then rerun")
@@ -1648,6 +1658,10 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
                        "using it", EXIT_BUSY, "busy",
                        "find who booted it (an open xcodebuild, a manual session), let them "
                        "finish and shut it down, then rerun")
+        if expect_udid is not None and udid != expect_udid:
+            note(udid=udid, action=result["action"])
+            raise Fail(f"'{name}' resolved to {udid}, expected {expect_udid}",
+                       kind="udid-changed", next_step="check the resolved device UDID")
         lease_file, wrote_new = None, False
         if lease:
             lease_file = lease_path(name, lease)
@@ -1683,11 +1697,11 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
                         wrote_record = True
                     log(f"booting {name}")
                     with phase("boot"):
-                        simctl("boot", udid, timeout=STATE_TIMEOUT)
+                        simctl("boot", udid, timeout=STATE_TIMEOUT, lease_fd=fd)
                     booted_by_us = True
                 # Booting devices too: return only once it is usable.
                 with phase("boot"):
-                    simctl("bootstatus", udid, "-b", timeout=BOOT_TIMEOUT)
+                    simctl("bootstatus", udid, "-b", timeout=BOOT_TIMEOUT, lease_fd=fd)
         except BaseException:
             keep_lease = False
             if wrote_record and not booted_by_us:
@@ -1719,12 +1733,6 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
         result.update(name=name, state=device_state(udid), bootedByUs=booted_by_us,
                       lease=lease, warnings=warnings)
         if held_lease:
-            if expect_udid is not None and udid != expect_udid:
-                note(udid=udid, action=result["action"])
-                release_locked(name, lease, held_udid=udid)
-                remove_file(held_lock_path(lease_file))
-                raise Fail(f"'{name}' resolved to {udid}, expected {expect_udid}",
-                           kind="udid-changed", next_step="check the resolved device UDID")
             result["leaseFd"] = fd
             held_fd.pop_all()
         return result
@@ -1786,11 +1794,21 @@ def release_locked(name, lease, shutdown=False, *, held_udid=None):
 
 
 def run_release(name, owner, udid, fd, wait):
-    lock_file = held_lock_path(lease_path(name, owner))
+    path = lease_path(name, owner)
+    lock_file = held_lock_path(path)
     with ExitStack() as held_fd:
         held_fd.callback(os.close, fd)
         with DeviceLock(name, wait):
-            held_fd.close()
+            try:
+                record = read_holder(path)
+                if not isinstance(record, dict) or record.get("kind") != "held":
+                    record = {}
+                if record.get("pid") == os.getpid():
+                    record.pop("pid")
+                    record.pop("pidStartedAt", None)
+                    write_json(path, record)
+            finally:
+                held_fd.close()
             with open(lock_file, "rb") as lock:
                 deadline = time.monotonic() + HELD_RELEASE_TIMEOUT
                 while True:
@@ -1799,154 +1817,94 @@ def run_release(name, owner, udid, fd, wait):
                         break
                     except BlockingIOError:
                         if time.monotonic() >= deadline:
-                            # The recorded PID is ours and we just closed our fd. We
-                            # cannot identify the descendant still holding the lock.
-                            lease = {"owner": owner, "lockFile": lock_file, "alive": True}
+                            lease = dict(record, owner=owner, lockFile=lock_file, alive=True)
                             raise held_leased_fail(name, [lease], kind="held-by-other")
                         time.sleep(0.05)
                 release_locked(name, owner, held_udid=udid)
                 remove_file(lock_file)
 
 
-def tty_foreground():
-    if os.isatty(0):
-        try:
-            return os.tcgetpgrp(0)
-        except OSError as exc:
-            if exc.errno != errno.ENOTTY:
-                raise
-            # A tty opened as stdin need not be our controlling terminal.
-    return None
-
-
-def give_tty_to(pgid):
-    # A process outside the foreground group may change it with SIGTTOU blocked.
-    old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTTOU})
+def signal_run_child(pid, signum):
     try:
-        os.tcsetpgrp(0, pgid)
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, old)
-
-
-def signal_group(pgid, signum):
-    try:
-        os.killpg(pgid, signum)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-def fork_run_child(command, env, foreground, mask):
-    pid = os.fork()
-    if pid == 0:
-        try:
-            os.setpgrp()
-            for signum in (*RUN_SIGNALS, signal.SIGPIPE, signal.SIGXFSZ):
-                signal.signal(signum, signal.SIG_DFL)
-            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-            if foreground is not None:
-                # Hand over the tty before exec, so an immediate read cannot get SIGTTIN.
-                give_tty_to(os.getpgrp())
-            os.execvpe(command[0], command, env)
-        except BaseException as exc:
-            try:
-                os.write(2, f"sim-vault: cannot start {command[0]!r}: {exc}\n".encode(
-                    errors="backslashreplace"))
-            finally:
-                os._exit(127 if isinstance(exc, FileNotFoundError) else 126)
-    try:
-        # Either side can establish the group first. This lets the parent forward
-        # signals even before the child has finished its setup.
-        os.setpgid(pid, pid)
-    except (PermissionError, ProcessLookupError):
-        pass  # Already exec'd after setting its own group, or already gone.
-    return pid
-
-
-def wait_run_child(pid, foreground):
-    while True:
-        _, status = os.waitpid(pid, os.WUNTRACED if foreground is not None else 0)
-        if not os.WIFSTOPPED(status):
-            rc = os.waitstatus_to_exitcode(status)
-            return 128 - rc if rc < 0 else rc
-        give_tty_to(foreground)
-        os.kill(os.getpid(), signal.SIGSTOP)
-        # Execution resumes here on SIGCONT.
-        if signal_group(pid, 0):
-            give_tty_to(pid)
-            signal_group(pid, signal.SIGCONT)
-
-
-def terminate_run_group(pgid):
-    if signal_group(pgid, signal.SIGTERM):
-        deadline = time.monotonic() + RUN_GROUP_TIMEOUT
-        while signal_group(pgid, 0):
-            if time.monotonic() >= deadline:
-                signal_group(pgid, signal.SIGKILL)
-                return
-            time.sleep(0.05)
+        os.kill(pid, signum)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def run_command(args, command, outcome):
     owner = f"{args.lease}:{os.getpid()}-{secrets.token_hex(3)}"
-    acquired = ensure(args.name, args.create, args.boot, owner, args.exclusive,
-                      args.wait, args.deny_other_leases, args.allow_lease,
-                      held_lease=True, expect_udid=args.expect_udid)
-    udid, fd = acquired["udid"], acquired["leaseFd"]
-    outcome["stage"] = "child"
-    pgid = foreground = None
+    acquired = child = None
+    pending = received = None
     rc, kind = EXIT_ERROR, "child"
 
     def forward(signum, _frame):
-        if pgid is not None:
-            signal_group(pgid, signum)
+        nonlocal pending, received
+        received = signum
+        if child is None:
+            pending = signum
+        elif child.returncode is None:
+            signal_run_child(child.pid, signum)
 
     try:
+        # Defer interruptions until the lease is safely in this scope. A signal
+        # during Popen is delivered once it returns with the child PID.
+        for signum in RUN_SIGNALS:
+            signal.signal(signum, forward)
+        acquired = ensure(args.name, args.create, args.boot, owner, args.exclusive,
+                          args.wait, args.deny_other_leases, args.allow_lease,
+                          held_lease=True, expect_udid=args.expect_udid)
+        udid, fd = acquired["udid"], acquired["leaseFd"]
         note(action=acquired["action"], udid=udid)
-        foreground = tty_foreground()
         os.set_inheritable(fd, True)
         env = dict(os.environ, SIM_VAULT_NAME=args.name, SIM_VAULT_UDID=udid,
                    SIM_VAULT_LEASE=owner, SIM_VAULT_LEASE_FD=str(fd))
+        if pending is not None:
+            raise Interrupted(pending)
+        outcome["stage"] = "child"
         with phase("child"):
-            mask = signal.pthread_sigmask(signal.SIG_BLOCK, RUN_SIGNALS)
             try:
-                for signum in RUN_SIGNALS:
-                    signal.signal(signum, forward)
-                # fork/exec preserves all inherited fds. The DeviceLock was closed
-                # by ensure before we get here; the lease fd remains open.
-                pgid = fork_run_child(command, env, foreground, mask)
-            finally:
-                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-            rc = outcome["childRc"] = wait_run_child(pgid, foreground)
+                # The shell manages the existing process group. The DeviceLock is
+                # already closed, and every caller fd and the lease fd pass through.
+                child = subprocess.Popen(command, env=env, close_fds=False)
+            except OSError as exc:
+                rc = outcome["childRc"] = 127 if isinstance(exc, FileNotFoundError) else 126
+                log(f"cannot start {command[0]!r}: {exc}")
+            else:
+                if pending is not None:
+                    signal_run_child(child.pid, pending)
+                child_rc = child.wait()
+                child = None
+                rc = outcome["childRc"] = 128 - child_rc if child_rc < 0 else child_rc
     except Interrupted as exc:
         rc, kind = 128 + exc.signum, "interrupted"
+        received = exc.signum
         log(f"error (exit {rc}, {kind}): interrupted by signal {exc.signum}")
     except Exception as exc:
+        if acquired is None:
+            raise
         log(f"error (exit {rc}, {kind}): {exc}")
     finally:
-        try:
-            with phase("teardown"):
-                try:
-                    if pgid is not None:
-                        try:
-                            if foreground is not None:
-                                give_tty_to(foreground)
-                        finally:
-                            terminate_run_group(pgid)
-                finally:
-                    run_release(args.name, owner, udid, fd, args.wait)
-            outcome["teardown"] = "ok"
-        except Exception as exc:
-            failure = exc if isinstance(exc, Fail) else Fail(str(exc), kind="teardown")
-            outcome["teardown"] = ("held-by-other" if failure.kind == "held-by-other"
-                                   else "failed")
-            if rc:
-                log(f"warning: teardown failed (exit {failure.code}, {failure.kind}): {failure}")
-            else:
-                outcome["stage"] = "teardown"
-                rc, kind = failure.code, failure.kind
-                log(f"error (exit {rc}, {kind}): {failure}")
-            log(f"next: {failure.next_step}")
+        child = None
+        for signum in RUN_SIGNALS:
+            signal.signal(signum, signal.SIG_IGN)
+        if received is not None:
+            note(signal=received)
+        if acquired is not None:
+            try:
+                with phase("teardown"):
+                    run_release(args.name, owner, acquired["udid"], acquired["leaseFd"], args.wait)
+                outcome["teardown"] = "ok"
+            except Exception as exc:
+                failure = exc if isinstance(exc, Fail) else Fail(str(exc), kind="teardown")
+                outcome["teardown"] = ("held-by-other" if failure.kind == "held-by-other"
+                                       else "failed")
+                if rc:
+                    log(f"warning: teardown failed (exit {failure.code}, {failure.kind}): {failure}")
+                else:
+                    outcome["stage"] = "teardown"
+                    rc, kind = failure.code, failure.kind
+                    log(f"error (exit {rc}, {kind}): {failure}")
+                log(f"next: {failure.next_step}")
     return rc, kind if rc else None
 
 
@@ -2381,16 +2339,18 @@ def build_parser():
                        formatter_class=argparse.RawDescriptionHelpFormatter,
                        epilog="""The command receives SIM_VAULT_NAME, SIM_VAULT_UDID, SIM_VAULT_LEASE
 (the full owner) and SIM_VAULT_LEASE_FD. Its stdout goes directly to the caller.
+The shell manages job control for run and the command as one job.
 
 Python launchers must pass the lease descriptor via pass_fds=(fd,), where
-fd = int(os.environ["SIM_VAULT_LEASE_FD"]). Close it for long-lived helpers:
+fd = int(os.environ["SIM_VAULT_LEASE_FD"]). Background helpers must close it:
   eval "helper ... ${SIM_VAULT_LEASE_FD}>&-"
 Use numeric fd redirection on macOS /bin/bash 3.2. For a background command,
 put the & inside eval so the background shell drops the descriptor:
   eval "helper ... ${SIM_VAULT_LEASE_FD}>&- &"
 
-If a leftover process keeps the lease alive, use the reported lsof <lock path>
-command to find candidates. Verify the process is yours before using kill <pid>.
+If a leftover process keeps the lease alive, run reports teardown=held-by-other
+and leaves the process running. Use the reported lsof <lock path> command to find
+candidates. Verify the process is yours before using kill <pid>.
 The next command that takes the device lock removes the lease after the last
 holder exits. Run leaves the device running during teardown.
 
@@ -2400,7 +2360,7 @@ Use --result-file to get the same fields as JSON.""")
     p.add_argument("--lease", required=True, metavar="PREFIX",
                    help="unique held lease owner with this prefix")
     p.add_argument("--expect-udid", metavar="UDID",
-                   help="withdraw the lease and exit 1 if the resolved UDID differs")
+                   help="exit 1 before leasing or booting if the resolved UDID differs")
     p.add_argument("--result-file", metavar="FILE",
                    help="write the run result as JSON")
     acquisition_flags(p, held=True)
@@ -2465,6 +2425,17 @@ def emit(as_json, payload):
         print(json.dumps(payload, ensure_ascii=False))
 
 
+def write_run_result(path, outcome):
+    fd, temporary = tempfile.mkstemp(prefix=".sim-vault-result-", suffix=".partial",
+                                     dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(outcome, handle, indent=2)
+        os.replace(temporary, path)
+    finally:
+        remove_file(temporary)
+
+
 def write_history(record):
     """Append one JSON line to history.jsonl. O_APPEND plus flock keeps lines of parallel
     runs whole. A failure only warns: the exit code and stdout stay as they are."""
@@ -2518,6 +2489,8 @@ def history_record(argv, args, rc, kind, run_outcome=None):
               "phases": phases}
     if run_outcome is not None:
         record.update(run_outcome, lockWait=phases.get("lockWait", 0), child=phases.get("child"))
+        if "signal" in fields:
+            record["signal"] = fields["signal"]
     return record
 
 
@@ -2629,7 +2602,7 @@ def main():
         result_file = getattr(args, "result_file", None)
         if result_file is not None:
             try:
-                write_json(result_file, run_outcome)
+                write_run_result(result_file, run_outcome)
             except OSError as exc:
                 log(f"warning: could not write {result_file}: {exc}")
     try:
@@ -2643,9 +2616,9 @@ def main():
             payload.update(seconds=record["seconds"], phases=record["phases"])
     if run_outcome is not None:
         child_rc = run_outcome["childRc"]
-        print(f"sim-vault-run: stage={run_outcome['stage']} rc={rc} "
-              f"childRc={'-' if child_rc is None else child_rc} "
-              f"teardown={run_outcome['teardown']}", file=sys.stderr, flush=True)
+        write_stderr(f"sim-vault-run: stage={run_outcome['stage']} rc={rc} "
+                     f"childRc={'-' if child_rc is None else child_rc} "
+                     f"teardown={run_outcome['teardown']}")
     else:
         emit(as_json, payload)
     sys.exit(rc)

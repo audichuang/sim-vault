@@ -66,18 +66,20 @@ The command inherits `SIM_VAULT_NAME`, `SIM_VAULT_UDID`, the full owner in
 `ensure` calls. `--allow-lease` applies during acquisition.
 
 Pass `int(os.environ["SIM_VAULT_LEASE_FD"])` in Python's `subprocess.Popen`
-`pass_fds` tuple for any launcher that needs to keep the lease alive. Close the
-descriptor for long-lived helpers. In bash, use numeric redirection for macOS
+`pass_fds` tuple for any launcher that needs to keep the lease alive. Background
+helpers must close the descriptor. In bash, use numeric redirection for macOS
 `/bin/bash` 3.2. Put the background operator inside the `eval` string.
 
 ```bash
 eval "helper ... ${SIM_VAULT_LEASE_FD}>&- &"
 ```
 
-The final stderr line and optional `--result-file` JSON give the stage, exit
-code, child exit code and teardown result. Teardown leaves the device running.
-If an escaped process still holds the lock, use the reported `lsof <lock path>`
-command to find candidates and verify ownership before using `kill <pid>`.
+The shell manages job control for `run` and its command as one job. The final
+stderr line and optional `--result-file` JSON give the stage, exit code, child
+exit code and teardown result. Teardown leaves the device running. If a
+background process still holds the lock, `run` reports `teardown=held-by-other`
+and leaves the process running. Use the reported `lsof <lock path>` command
+to find candidates and verify ownership before using `kill <pid>`.
 The next command that takes the device lock removes the lease after the last
 holder exits.
 

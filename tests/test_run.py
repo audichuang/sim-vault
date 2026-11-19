@@ -10,6 +10,7 @@ import select
 import shlex
 import signal
 import subprocess
+import textwrap
 import threading
 import time
 
@@ -95,6 +96,17 @@ class RunTests(SimVaultCase):
                         self.fail(f"{path} stayed locked")
                     time.sleep(0.02)
 
+    def wait_for(self, predicate, message):
+        deadline = time.monotonic() + READY_TIMEOUT
+        while not predicate():
+            self.assertLess(time.monotonic(), deadline, message)
+            time.sleep(0.02)
+
+    def loader_hook(self, code):
+        path = Path(self.loader)
+        setup = path.read_text().removesuffix("mod.main()\n")
+        path.write_text(setup + textwrap.dedent(code) + "\nmod.main()\n")
+
     def test_child_environment_live_lease_and_release_without_shutdown(self):
         udid = self.create(NAME)
         code = """
@@ -115,7 +127,9 @@ sys.stdin.read()
         with self.running([PY, "-c", code, str(self.device_lock)], "--boot",
                           "--expect-udid", udid) as proc:
             name, resolved, owner, pid, pgid = json.loads(self.ready(proc))
-            self.assertEqual((name, resolved, pgid), (NAME, udid, pid))
+            self.assertEqual((name, resolved), (NAME, udid))
+            self.assertNotEqual(pid, proc.pid)
+            self.assertEqual(pgid, os.getpgid(proc.pid))
             self.assertRegex(owner, rf"^{PREFIX}:{proc.pid}-[0-9a-f]{{6}}$")
             lease, = self.leases()
             self.assertEqual((lease["owner"], lease["kind"], lease["mode"], lease["alive"]),
@@ -139,18 +153,21 @@ sys.stdin.read()
                 self.assertEqual(json.loads(self.result.read_text()),
                                  {"stage": "child", "rc": code, "childRc": code, "teardown": "ok"})
 
-    def test_forwards_signals_to_child_group(self):
+    def test_forwards_signals_sent_only_to_run_and_reaps_child(self):
         self.create(NAME)
-        code = "import time; print('ready', flush=True); time.sleep(60)"
+        code = "import os, time; print(os.getpgrp(), flush=True); time.sleep(60)"
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             with self.subTest(signum=signum):
                 with self.running([PY, "-c", code]) as proc:
-                    self.assertEqual(self.ready(proc), "ready")
+                    pgid = int(self.ready(proc))
                     proc.send_signal(signum)
                     _, stderr = proc.communicate(timeout=READY_TIMEOUT)
                     rc = 128 + signum
                     self.assertEqual(proc.returncode, rc, stderr)
                     self.assert_summary(stderr, "child", rc, rc, "ok")
+                    self.assertEqual(pgid, os.getpgid(0), "child left run's process group")
+                    entry = json.loads((self.root / "history.jsonl").read_text().splitlines()[-1])
+                    self.assertEqual(entry["signal"], signum)
                 self.assertEqual(self.leases(), [])
 
     def test_acquisition_failures_never_launch_child(self):
@@ -180,6 +197,61 @@ sys.stdin.read()
         self.assertEqual(proc.returncode, rc, proc.stderr)
         self.assertIn(f"error (exit {rc}, {kind})", proc.stderr)
         self.assert_summary(proc.stderr, "acquire", rc, None, "-")
+
+    def test_expected_udid_mismatch_with_boot_does_not_start_or_write_lease(self):
+        udid = self.create(NAME)
+        marker = Path(self.base) / "started"
+        proc = self.run_sv(f"open({str(marker)!r}, 'w').close()", "--expect-udid", "wrong",
+                           "--boot")
+        self.check_acquisition_failure(proc, 1, "udid-changed")
+        self.assertFalse(marker.exists())
+        calls = [json.loads(line)[:2] for line in (Path(self.fake) / "log").read_text().splitlines()]
+        self.assertNotIn(["simctl", "boot"], calls)
+        self.assertNotIn(["simctl", "bootstatus"], calls)
+        self.assertFalse(self.directory.exists())
+        self.assertEqual(self.state(udid), "Shutdown")
+
+    def test_boot_stub_keeps_lease_after_run_is_killed(self):
+        self.assert_boot_step_keeps_lease("boot")
+
+    def test_bootstatus_stub_keeps_lease_after_run_is_killed(self):
+        self.assert_boot_step_keeps_lease("bootstatus")
+
+    def assert_boot_step_keeps_lease(self, step):
+        stub = Path(self.stub) / "xcrun"
+        stub.write_text(stub.read_text().replace(
+            '            time.sleep(hk["seconds"])',
+            textwrap.indent(textwrap.dedent("""
+                import signal
+                with open(os.path.join(root, "boot-paused"), "w") as ready:
+                    print(os.getpid(), file=ready)
+                os.kill(os.getpid(), signal.SIGSTOP)
+            """).strip(), " " * 12),
+        ))
+        udid = self.create(NAME)
+        self.hooks([{"cmd": step, "n": 1, "action": "sleep", "seconds": 0}])
+        paused = Path(self.fake) / "boot-paused"
+        with self.running([PY, "-c", "raise SystemExit(65)"], "--boot") as proc:
+            self.wait_for(lambda: paused.exists() and paused.stat().st_size,
+                          f"stub never paused in {step}")
+            stub_pid = int(paused.read_text())
+            try:
+                lease, = self.leases()
+                lock = self.lease_lock(lease["owner"])
+                proc.kill()
+                self.assertEqual(proc.wait(timeout=READY_TIMEOUT), -signal.SIGKILL)
+                shutdown = self.sv("shutdown", NAME)
+                park = self.sv("park", NAME, "--shutdown")
+                self.assertEqual((shutdown.returncode, park.returncode), (8, 8),
+                                 shutdown.stderr + park.stderr)
+                self.assert_no_shutdown()
+            finally:
+                os.kill(stub_pid, signal.SIGCONT)
+        self.await_unlocked(lock)
+        self.assertEqual(self.state(udid), "Booted")
+        self.assertEqual(self.sv("ensure", NAME).returncode, 0)
+        self.assertEqual(self.leases(), [])
+        self.assert_no_shutdown()
 
     def test_failed_bootstatus_undoes_own_boot(self):
         udid = self.create(NAME)
@@ -244,22 +316,22 @@ fd = int(os.environ["SIM_VAULT_LEASE_FD"])
 sleep = subprocess.Popen(["/bin/sleep", "60"], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          pass_fds=(fd,) if sys.argv[1] == "pass" else ())
-print(os.environ["SIM_VAULT_LEASE"], os.getpgrp(), os.getpid(), sleep.pid, flush=True)
+print(os.environ["SIM_VAULT_LEASE"], sys.argv[2], os.getpid(), sleep.pid, flush=True)
 sleep.wait()
 """
         for mode in ("drop", "pass"):
             with self.subTest(mode=mode):
-                shell = '"$1" -c "$2" "$3" & wait'
+                shell = '"$1" -c "$2" "$3" "$$" & wait'
                 with self.running(["/bin/bash", "-c", shell, "bash", PY, code, mode],
                                   "--deny-other-leases") as proc:
-                    owner, pgid, middle, sleeper = self.ready(proc).split()
+                    owner, shell_pid, middle, sleeper = self.ready(proc).split()
                     try:
                         proc.kill()
                         proc.wait(timeout=READY_TIMEOUT)
                         self.kill_pid(int(middle))
                         # The script's shell has the fd until it notices Python exited.
                         # End the shell too, leaving just the grandchild sleep.
-                        self.kill_pid(int(pgid))
+                        self.kill_pid(int(shell_pid))
                         if mode == "drop":
                             self.await_unlocked(self.lease_lock(owner))
                         blocked = self.sv("ensure", NAME, "--lease", "other")
@@ -346,6 +418,168 @@ raise SystemExit(int(sys.argv[2]))
                         self.assertFalse(lock.exists())
         self.assert_no_shutdown()
 
+    def test_same_group_background_process_is_left_alive_and_lease_is_kept(self):
+        self.create(NAME)
+        script = (
+            '/bin/sleep 60 </dev/null >/dev/null 2>&1 & '
+            'printf "%s %s\n" "$SIM_VAULT_LEASE" "$!"'
+        )
+        with self.running(["/bin/bash", "-c", script]) as proc:
+            owner, sleeper = self.ready(proc).split()
+            try:
+                _, stderr = proc.communicate(timeout=READY_TIMEOUT)
+                self.assertEqual(proc.returncode, 8, stderr)
+                self.assert_summary(stderr, "teardown", 8, 0, "held-by-other")
+                lease, = self.leases()
+                self.assertEqual((lease["owner"], lease["alive"]), (owner, True))
+            finally:
+                self.kill_pid(int(sleeper))
+        self.await_unlocked(self.lease_lock(owner))
+
+    def test_teardown_retry_status_does_not_list_run_as_lease_holder(self):
+        self.create(NAME)
+        child = """
+import os, subprocess
+fd = int(os.environ["SIM_VAULT_LEASE_FD"])
+leftover = subprocess.Popen(["/bin/sleep", "60"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True, pass_fds=(fd,))
+print(leftover.pid, flush=True)
+"""
+        with self.running([PY, "-c", child]) as proc:
+            sleeper = int(self.ready(proc))
+            try:
+                # The child has started after acquisition released DeviceLock.
+                # The next holder of this device lock is run's teardown retry.
+                def releasing():
+                    with self.device_lock.open("rb") as lock:
+                        try:
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            return True
+                    return False
+
+                self.wait_for(releasing, "run never entered teardown")
+                lease, = self.leases()
+                self.assertTrue(lease["alive"])
+                self.assertNotIn(proc.pid, lease["holderPids"], lease)
+                self.assertIsNone(lease["pid"], lease)
+                self.assertIsNone(proc.poll(), "teardown had already finished")
+            finally:
+                self.kill_pid(sleeper)
+            _, stderr = proc.communicate(timeout=READY_TIMEOUT)
+            self.assertEqual(proc.returncode, 0, stderr)
+            self.assert_summary(stderr, "child", 0, 0, "ok")
+        self.assertEqual(self.leases(), [])
+
+    def test_interrupt_at_acquire_handoff_releases_lease_without_launching(self):
+        self.create(NAME)
+        self.loader_hook("""
+            import signal
+            original_ensure = mod.ensure
+            def interrupt_after_ensure(*args, **kwargs):
+                result = original_ensure(*args, **kwargs)
+                os.kill(os.getpid(), signal.SIGTERM)
+                return result
+            mod.ensure = interrupt_after_ensure
+        """)
+        marker = Path(self.base) / "started"
+        proc = self.run_sv(f"open({str(marker)!r}, 'w').close()")
+        self.assertEqual(proc.returncode, 143, proc.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual(list(self.directory.iterdir()), [], proc.stderr)
+        self.assert_summary(proc.stderr, "acquire", 143, None, "ok")
+
+    def test_signals_during_teardown_are_not_forwarded_to_reaped_child(self):
+        self.create(NAME)
+        forwarded = Path(self.base) / "forwarded"
+        self.loader_hook(f"""
+            import signal
+            from pathlib import Path
+            original_release = mod.run_release
+            kill = os.kill
+            killpg = os.killpg
+            def watch(fn):
+                def watched(pid, signum):
+                    Path({str(forwarded)!r}).write_text(str(pid))
+                    return fn(pid, signum)
+                return watched
+            def signal_during_release(*args, **kwargs):
+                os.kill = watch(kill)
+                os.killpg = watch(killpg)
+                try:
+                    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                        kill(os.getpid(), signum)
+                    return original_release(*args, **kwargs)
+                finally:
+                    os.kill = kill
+                    os.killpg = killpg
+            mod.run_release = signal_during_release
+        """)
+        proc = self.run_sv("raise SystemExit(65)")
+        self.assertEqual(proc.returncode, 65, proc.stderr)
+        self.assert_summary(proc.stderr, "child", 65, 65, "ok")
+        self.assertFalse(forwarded.exists(), "a signal was forwarded after reaping the child")
+        self.assertEqual(self.leases(), [])
+
+    def test_closed_stderr_pipe_preserves_child_rc(self):
+        self.create(NAME)
+        bogus_parent = Path(self.base) / "not-a-directory"
+        bogus_parent.touch()
+        code = "import sys; print('ready', flush=True); sys.stdin.read(); sys.exit(65)"
+        for warning in (None, "result-file", "history"):
+            with self.subTest(warning=warning):
+                bad_path = str(bogus_parent / "out")
+                flags = ["--result-file", bad_path] if warning == "result-file" else []
+                env = self.env(**({"SIM_VAULT_HISTORY": bad_path} if warning == "history" else {}))
+                args = self.args(flags, [PY, "-c", code])
+                with subprocess.Popen([PY, self.loader, *args], env=env, stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      text=True) as proc:
+                    try:
+                        self.assertEqual(self.ready(proc), "ready")
+                        proc.stderr.close()  # Close the only reader before teardown logs.
+                    finally:
+                        proc.stdin.close()
+                    self.assertEqual(proc.wait(timeout=READY_TIMEOUT), 65)
+                self.assertEqual(self.leases(), [])
+
+    def test_concurrent_writers_use_distinct_temps_for_same_result_file(self):
+        self.create(NAME)
+        self.loader_hook(f"""
+            from pathlib import Path
+            import time
+            target = Path({str(self.result)!r})
+            replace = os.replace
+            def replace_together(src, dst):
+                if Path(dst) == target:
+                    pid = os.getpid()
+                    target.with_name(f"ready-{{pid}}").write_text(str(src))
+                    deadline = time.monotonic() + 8
+                    while len(list(target.parent.glob("ready-*"))) < 2:
+                        assert time.monotonic() < deadline, "second run never reached rename"
+                        time.sleep(0.02)
+                return replace(src, dst)
+            os.replace = replace_together
+        """)
+        def cmd(rc):
+            return [PY, "-c", f"raise SystemExit({rc})"]
+
+        flags = ("--result-file", str(self.result))
+        with self.running(cmd(8), *flags) as first, self.running(cmd(65), *flags) as second:
+            _, first_stderr = first.communicate(timeout=READY_TIMEOUT)
+            _, second_stderr = second.communicate(timeout=READY_TIMEOUT)
+            self.assertEqual((first.returncode, second.returncode), (8, 65),
+                             first_stderr + second_stderr)
+            temps = {path.read_text() for path in self.result.parent.glob("ready-*")}
+            self.assertEqual(len(temps), 2, first_stderr + second_stderr)
+            self.assertTrue(all(Path(src).parent == self.result.parent for src in temps))
+            self.assertTrue(all(not Path(src).exists() for src in temps))
+            self.assertNotIn("could not write", first_stderr + second_stderr)
+        result = json.loads(self.result.read_text())
+        self.assertIn(result["rc"], (8, 65))
+        self.assertEqual(result["rc"], result["childRc"])
+
     def test_status_probes_during_teardown_and_boot_record_handoff(self):
         udid = self.create(NAME)
         code = """
@@ -430,26 +664,27 @@ print("exiting", flush=True)
                      "lsof", "kill", "-- <cmd"):
             self.assertIn(text, proc.stdout)
 
-    def test_ctrl_z_returns_tty_then_sigcont_resumes_foreground_child(self):
+    def test_background_job_does_not_change_terminal_foreground_group(self):
         self.create(NAME)
         code = """
 import os
-assert os.tcgetpgrp(0) == os.getpgrp()
-print("TTY_READY", flush=True)
-os.read(0, 128)
-assert os.tcgetpgrp(0) == os.getpgrp()
-print("TTY_RESUMED", flush=True)
+with open("/dev/tty") as tty:
+    print("FOREGROUND=" + str(os.tcgetpgrp(tty.fileno())), flush=True)
+print("CHILD_GROUP=" + str(os.getpgrp()), flush=True)
 """
         env = self.env()
-        argv = [PY, self.loader, *self.args((), [PY, "-c", code])]
+        command = shlex.join([PY, self.loader, *self.args((), [PY, "-c", code])])
+        script = (f'printf "SHELL_GROUP=%s\n" "$$"; {command} & '
+                  'job=$!; printf "RUN_GROUP=%s\n" "$job"; wait "$job"; '
+                  'rc=$?; printf "JOB_DONE=%s\n" "$rc"; exit "$rc"')
+        argv = ["/bin/bash", "--noprofile", "--norc", "-ic", script]
         pid, tty_fd = pty.fork()
         if pid == 0:
-            os.execve(PY, argv, env)
+            os.execve(argv[0], argv, env)
         terminal = bytearray()
-
-        def read_until(marker, timeout=READY_TIMEOUT):
-            deadline = time.monotonic() + timeout
-            while marker not in terminal:
+        try:
+            deadline = time.monotonic() + READY_TIMEOUT
+            while b"JOB_DONE=" not in terminal or not terminal.endswith(b"\r\n"):
                 left = deadline - time.monotonic()
                 self.assertTrue(left > 0 and select.select([tty_fd], [], [], left)[0],
                                 terminal.decode(errors="replace"))
@@ -459,30 +694,15 @@ print("TTY_RESUMED", flush=True)
                     data = b""
                 self.assertTrue(data, terminal.decode(errors="replace"))
                 terminal.extend(data)
-
-        waited = False
-        try:
-            read_until(b"TTY_READY\r\n")
-            os.write(tty_fd, b"\x1a")
-            deadline = time.monotonic() + READY_TIMEOUT
-            while True:
-                stopped, status = os.waitpid(pid, os.WUNTRACED | os.WNOHANG)
-                if stopped:
-                    waited = os.WIFEXITED(status) or os.WIFSIGNALED(status)
-                    self.assertTrue(os.WIFSTOPPED(status), terminal)
-                    break
-                self.assertLess(time.monotonic(), deadline, "run did not stop on Ctrl-Z")
-                time.sleep(0.02)
-            os.kill(pid, signal.SIGCONT)
-            os.write(tty_fd, b"resume\n")
-            read_until(b"teardown=ok\r\n")
-            _, status = os.waitpid(pid, 0)
-            waited = True
-            self.assertEqual(os.waitstatus_to_exitcode(status), 0, terminal)
-            self.assertIn(b"TTY_RESUMED\r\n", terminal)
+            output = terminal.decode(errors="replace")
+            groups = dict(line.split("=", 1) for line in output.splitlines()
+                          if line.startswith(("FOREGROUND=", "SHELL_GROUP=", "RUN_GROUP=",
+                                              "CHILD_GROUP=", "JOB_DONE=")))
+            self.assertEqual(groups["FOREGROUND"], groups["SHELL_GROUP"], output)
+            self.assertEqual(groups["CHILD_GROUP"], groups["RUN_GROUP"], output)
+            self.assertEqual(groups["JOB_DONE"], "0", output)
             self.assertEqual(self.leases(), [])
         finally:
-            if not waited:
-                self.kill_pid(pid)
-                os.waitpid(pid, 0)
             os.close(tty_fd)
+            self.wait_for(lambda: os.waitpid(pid, os.WNOHANG)[0],
+                          "job-control shell did not exit after the pty was closed")
