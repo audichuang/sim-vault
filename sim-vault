@@ -43,8 +43,9 @@ exit codes and what the caller does next:
   1  error (simctl, tar, read-back mismatch, several devices with the name): stop, look, do
      not recreate the device. Kinds worth knowing: archive-incomplete (restore/ensure: the
      vault has the tar but no metadata; never treated as "no archive", --create does not
-     create), lease-unreadable (park/shutdown/ensure --deny-other-leases: a lease file
-     cannot be read, so nothing was shut down or deleted), pending-pair (park: an
+     create), lease-unreadable (park, shutdown, release --shutdown, ensure
+     --deny-other-leases: a lease file cannot be read, so nothing was shut down or
+     deleted), pending-pair (park: an
      interrupted park left a tar without matching metadata and pairing failed)
   2  usage
   3  no archive (restore/ensure without --create): project policy - create the device or ask
@@ -1177,7 +1178,8 @@ def restore_locked(name, warnings=None):
                 "matchesArchive": matches, "archive": info,
                 "needsReplaceOnFirstPark": matches is False or (
                     meta is None and info.get("udid") is not None
-                    and existing["udid"] not in (info.get("udid"), info.get("restoredAs")))}
+                    and existing["udid"] not in (info.get("udid"), info.get("restoredAs")))
+                    or "archive-incomplete" in (info.get("error") or "")}
     vault = vault_dir()
     tar_path, meta_path = archive_paths(vault, name)
     meta = read_meta(meta_path)
@@ -1389,7 +1391,8 @@ def release(name, lease, shutdown=False, wait=DEFAULT_WAIT):
         record = reconcile_boot_record(name, devices)
         path = lease_path(name, lease)
         existed = os.path.exists(path)
-        others = [l for l in read_leases(name) if l.get("owner") != lease]
+        # Strict with --shutdown: an unreadable lease may be someone's live one.
+        others = [l for l in read_leases(name, strict=shutdown) if l.get("owner") != lease]
         responsible = bool(record) and existed and lease in record.get("by", [])
         did_shutdown = False
         if shutdown and not others and responsible:

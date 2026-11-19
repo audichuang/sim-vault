@@ -2072,6 +2072,43 @@ class T4V3(SimVaultCase):
         self.assertEqual(self.js("ensure", "SVTEST a", "--lease", "x", "--allow-lease",
                                  "y")[0], 2)
 
+    def test_release_shutdown_stops_on_unreadable_lease(self):
+        udid = self.create("SVTEST a")
+        self.assertEqual(self.js("ensure", "SVTEST a", "--boot", "--lease", "A")[0], 0)
+        self.assertEqual(self.js("ensure", "SVTEST a", "--lease", "B")[0], 0)
+        b = [f for f in self.lease_files()
+             if json.load(open(f)).get("owner") == "B"][0]
+        write(b, "{broken")
+        rc, d = self.js("release", "SVTEST a", "--lease", "A", "--shutdown")
+        self.assertEqual((rc, d["kind"]), (1, "lease-unreadable"))
+        self.assertEqual(self.state(udid), "Booted")
+        self.assertEqual(len(self.lease_files()), 2)          # A's lease kept too
+        rc, d = self.js("release", "SVTEST a", "--lease", "A")  # plain release still works
+        self.assertEqual((rc, d["action"]), (0, "released"))
+
+    def test_gc_rechecks_pairing_under_lock(self):
+        self.parked("SVTEST a")
+        tar_partial = os.path.join(self.vault, "SVTEST a.tar.partial")
+        json_partial = os.path.join(self.vault, "SVTEST a.json.partial")
+        for p in (tar_partial, json_partial):
+            write(p, "{}")
+            os.utime(p, (time.time() - 7200, time.time() - 7200))
+        # Between gc's first look and its lock, the tar .partial is renamed into place:
+        # the JSON .partial is now the metadata that may pair with it.
+        code = (f"import os; os.replace({tar_partial!r}, "
+                f"{os.path.join(self.vault, 'SVTEST a.tar')!r})")
+        rc, d = self.js("gc", "--name-prefix", "SVTEST",
+                        SV_TEST_GC_HOOK=json.dumps([PY, "-c", code]))
+        self.assertEqual(rc, 0, d)
+        self.assertTrue(os.path.exists(json_partial))
+        self.assertNotIn(json_partial, [x["what"] for x in d["deleted"]])
+
+    def test_existing_with_orphan_tar_needs_replace(self):
+        self.orphan_tar()
+        self.create("SVTEST a")
+        rc, d = self.js("ensure", "SVTEST a")
+        self.assertEqual((rc, d["action"], d["needsReplaceOnFirstPark"]), (0, "existing", True))
+
 
 if __name__ == "__main__":
     unittest.main()
