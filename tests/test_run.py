@@ -19,7 +19,6 @@ from test_sim_vault import PY, SimVaultCase
 NAME = "SVTEST run"
 PREFIX = "test:run"
 READY_TIMEOUT = 10
-HOLD = "import time; time.sleep(60)"
 
 
 class RunTests(SimVaultCase):
@@ -142,7 +141,7 @@ sys.stdin.read()
 
     def test_forwards_signals_to_child_group(self):
         self.create(NAME)
-        code = "import os, signal, time; print('ready', flush=True); time.sleep(60)"
+        code = "import time; print('ready', flush=True); time.sleep(60)"
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             with self.subTest(signum=signum):
                 with self.running([PY, "-c", code]) as proc:
@@ -158,10 +157,10 @@ sys.stdin.read()
         os.mkdir(self.vault)
         marker = Path(self.base) / "started"
         child = f"open({str(marker)!r}, 'w').close()"
-        failures = [(3, "no-archive", (), {})]
-        proc = self.run_sv(child, **failures[0][3])
-        self.check_acquisition_failure(proc, *failures[0][:2])
+        proc = self.run_sv(child)
+        self.check_acquisition_failure(proc, 3, "no-archive")
         self.assertFalse(marker.exists())
+        self.assertEqual(self.leases(), [])
         self.create(NAME)
         self.assertEqual(self.sv("ensure", NAME, "--lease", "manual").returncode, 0)
         for rc, kind, flags in (
@@ -274,15 +273,15 @@ sleep.wait()
         self.create(NAME)
         script = r'''
 case $BASH_VERSION in 3.2.*) ;; *) exit 90;; esac
-eval "/usr/bin/nohup /bin/sleep 60 </dev/null >/dev/null 2>&1 ${SIM_VAULT_LEASE_FD}>&-" &
+eval "/bin/sleep 60 </dev/null >/dev/null 2>&1 ${SIM_VAULT_LEASE_FD}>&- &"
 printf '%s\n' "$!"
 '''
         # Put the helper outside run's group so success depends on closing its fd.
         # The script itself still runs under macOS /bin/bash and uses numeric redirection.
         launcher = """
-import subprocess, sys
+import os, subprocess, sys
 subprocess.run(["/bin/bash", "-c", sys.argv[1]], start_new_session=True,
-               pass_fds=(int(__import__("os").environ["SIM_VAULT_LEASE_FD"]),), check=True)
+               pass_fds=(int(os.environ["SIM_VAULT_LEASE_FD"]),), check=True)
 """
         with self.running([PY, "-c", launcher, script]) as proc:
             helper = int(self.ready(proc))
@@ -349,16 +348,17 @@ raise SystemExit(int(sys.argv[2]))
 
     def test_status_probes_during_teardown_and_boot_record_handoff(self):
         udid = self.create(NAME)
-        code = "import sys; print('ready', flush=True); sys.stdin.read()"
+        code = """
+import sys
+print("ready", flush=True)
+sys.stdin.read()
+print("exiting", flush=True)
+"""
         with self.running([PY, "-c", code], "--boot") as proc:
             self.assertEqual(self.ready(proc), "ready")
             lease, = self.leases()
             self.assertEqual(self.sv("ensure", NAME, "--lease", "remaining").returncode, 0)
             lock = self.lease_lock(lease["owner"])
-            # A real shared flock simulates a status probe paused just after run closes
-            # its fd. Hold it below the retry limit while also running status repeatedly.
-            device_fd = os.open(self.device_lock, os.O_RDONLY)
-            probe_fd = os.open(lock, os.O_RDONLY)
             stopped, probed = threading.Event(), threading.Event()
             statuses = []
 
@@ -370,15 +370,20 @@ raise SystemExit(int(sys.argv[2]))
             thread = threading.Thread(target=probe_status)
             thread.start()
             try:
-                self.assertTrue(probed.wait(READY_TIMEOUT))
-                _, stderr = proc.communicate("", timeout=READY_TIMEOUT)
+                # Keep tear-down waiting for DeviceLock while status probes it.
+                with self.device_lock.open("rb") as device_lock:
+                    fcntl.flock(device_lock, fcntl.LOCK_EX)
+                    proc.stdin.close()
+                    proc.stdin = None
+                    self.assertEqual(self.ready(proc), "exiting")
+                    probed.clear()
+                    self.assertTrue(probed.wait(READY_TIMEOUT))
+                _, stderr = proc.communicate(timeout=READY_TIMEOUT)
                 self.assertEqual(proc.returncode, 0, stderr)
                 self.assert_summary(stderr, "child", 0, 0, "ok")
             finally:
                 stopped.set()
                 thread.join()
-                os.close(probe_fd)
-                os.close(device_fd)
             self.assertTrue(all(status.returncode == 0 for status in statuses))
         self.assertFalse(lock.exists())
         status = json.loads(self.sv("status", NAME, "--json").stdout)

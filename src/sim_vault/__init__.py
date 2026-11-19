@@ -14,6 +14,7 @@ commands (see `sim-vault <command> --help` for flags):
   ensure <name>    use the local device, else restore it, else (3/4 with --create) create it;
                    optionally --boot and register a --lease (--deny-other-leases: 8 while
                    other owners hold one); prints the UDID
+  run <name>       acquire a held lease and run a command; see `run --help`
   restore <name>   `ensure` without policy, for people and old scripts: never creates or
                    boots, ignores leases; prints the UDID. Callers using leases use ensure
   park <name>      archive, verify, then delete the device (refuses while it is in use);
@@ -25,7 +26,7 @@ commands (see `sim-vault <command> --help` for flags):
   list             archives in the vault
   gc               remove what interrupted runs left behind (dry-run first)
 Held leases protect a device while a process holds their lock and expire when it exits.
-Every command takes --json: stdout is then exactly one JSON object, also on failure:
+Commands other than run take --json: stdout is then exactly one JSON object, also on failure:
 {"ok": false, "code": 5, "kind": "vault-unavailable", "message": "...", "next": "..."}.
 Messages go to stderr; a failure ends with "error (exit N, <kind>): <message>" and a
 "next:" line. --json results of ensure/restore/park/release/shutdown also carry "seconds"
@@ -36,8 +37,8 @@ The vault is $SIM_VAULT_DIR (default /Volumes/WorkSpace/ios-sim). It must sit on
 volume than ~/Library/Developer/CoreSimulator, so an unmounted share is refused instead of
 silently filling the local disk. Locks, leases and staging live in
 ~/Library/Developer/CoreSimulator/sim-vault/ (fixed paths, not $TMPDIR). Every ensure,
-restore, park, release and shutdown appends one JSON line (ts, cmd, name, udid, rc, kind,
-action, bytes, posterMB, cwd, pid, seconds, phases) to history.jsonl there, also on failure
+restore, park, release, shutdown and run appends one JSON line (ts, cmd, name, udid, rc,
+kind, action, bytes, posterMB, cwd, pid, seconds, phases) to history.jsonl, also on failure
 and on SIGTERM/SIGHUP/SIGINT; a history that cannot be written only warns. $SIM_VAULT_HISTORY
 overrides the path of history.jsonl (default: that directory).
 
@@ -74,14 +75,17 @@ exit codes and what the caller does next:
      archive can still be restored: stop and report; do not delete or park on your own
 """
 import argparse
+from contextlib import ExitStack
 import ctypes
 from datetime import datetime
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import plistlib
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -105,7 +109,7 @@ STAGING_ROOT = os.path.join(STATE_ROOT, "staging")
 LEGACY_STAGING_ROOT = os.path.join(SIM_ROOT, "sim-vault-staging")
 HISTORY_PATH = (os.environ.get("SIM_VAULT_HISTORY")
                 or os.path.join(STATE_ROOT, "history.jsonl"))
-HISTORY_COMMANDS = ("ensure", "restore", "park", "release", "shutdown")
+HISTORY_COMMANDS = ("ensure", "restore", "park", "release", "shutdown", "run")
 HISTORY_LOCK_TIMEOUT = 5
 POSTER_STORE = os.path.join("data", "Library", "Application Support",
                             "PRBPosterExtensionDataStore")
@@ -124,6 +128,9 @@ STATE_TIMEOUT = 120
 BOOT_TIMEOUT = 300
 POLL = 1.0
 DEFAULT_WAIT = 60
+RUN_GROUP_TIMEOUT = 10
+HELD_RELEASE_TIMEOUT = 5
+RUN_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 STALE_AFTER = 3600
 RESTORING = " [sim-vault restoring "
 
@@ -806,7 +813,7 @@ def held_candidate_hint(lease):
     return f"Find candidate processes with `lsof {shlex.quote(lease['lockFile'])}`."
 
 
-def held_leased_fail(name, leases):
+def held_leased_fail(name, leases, *, kind="busy"):
     require_readable_held(leases)
     descriptions, tips = [], []
     for lease in leases:
@@ -817,7 +824,7 @@ def held_leased_fail(name, leases):
         else:
             tips.append(held_candidate_hint(lease))
     tips.append("Wait for the holder to finish. The held lease disappears once it exits.")
-    return Fail(f"'{name}' is leased by {'; '.join(descriptions)}", EXIT_BUSY, "busy", " ".join(tips))
+    return Fail(f"'{name}' is leased by {'; '.join(descriptions)}", EXIT_BUSY, kind, " ".join(tips))
 
 
 def write_held_lease(name, owner, udid, mode):
@@ -1591,9 +1598,10 @@ def restore(name, wait=DEFAULT_WAIT):
 
 
 def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFAULT_WAIT,
-           deny_other_leases=False, allow_leases=()):
+           deny_other_leases=False, allow_leases=(), *, held_lease=False, expect_udid=None):
     warnings = []
-    with DeviceLock(name, wait):
+    with DeviceLock(name, wait), ExitStack() as held_fd:
+        fd = None
         held, _ = reap_held_leases(lease_dir(name))
         same_owner = same_held_owner(name, lease, held)
         if same_owner:
@@ -1627,8 +1635,7 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
         if blocking:
             raise leased_fail(name, blocking)
         if deny_other_leases:
-            # Unlike --exclusive: a running device without leases is fine, and later
-            # ensures by others are not refused; only current leases of others count.
+            # A running device may pass this check. Only other owners' current leases count.
             others = [l for l in read_leases(name, strict=True)
                       if l.get("kind") != "held" and l.get("owner") != lease
                       and l.get("owner") not in allow_leases]
@@ -1653,9 +1660,14 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
                 record = {"owner": lease, "udid": udid, "pid": os.getppid(), "createdAt": stamp,
                           "updatedAt": stamp, "mode": "exclusive" if exclusive else "shared"}
                 wrote_new = True
-            os.makedirs(lease_dir(name), exist_ok=True)
             # The lease goes in before booting, so a device we boot always has an owner.
-            write_json(lease_file, record)
+            if held_lease:
+                mode = "exclusive" if exclusive or deny_other_leases else "shared"
+                fd = write_held_lease(name, lease, udid, mode)
+                held_fd.callback(os.close, fd)
+            else:
+                os.makedirs(lease_dir(name), exist_ok=True)
+                write_json(lease_file, record)
         booted_by_us = wrote_record = False
         try:
             if boot:
@@ -1693,61 +1705,249 @@ def ensure(name, create=None, boot=False, lease=None, exclusive=False, wait=DEFA
                     CLEANUP_FAILURES.append(f"shut down {name}: {exc}")
                     log(f"warning: could not shut down {name} after the failed boot: {exc}; "
                         f"`sim-vault release '{name}' --lease {lease} --shutdown` retries")
-            if wrote_new and not keep_lease:
+            if held_lease and keep_lease:
+                # Preserve the v3 recovery via release --shutdown when undo fails.
+                write_json(lease_file, dict(record, mode=mode))
+            elif wrote_new and not keep_lease:
                 remove_file(lease_file)
+            if held_lease:
+                remove_file(held_lock_path(lease_file))
             raise
         if result.get("matchesArchive") is False and result["action"] == "existing":
             warnings.append("this device is not the archived one (the archive's runtime is "
                             "gone); its first park returns 7 and needs --replace")
         result.update(name=name, state=device_state(udid), bootedByUs=booted_by_us,
                       lease=lease, warnings=warnings)
+        if held_lease:
+            if expect_udid is not None and udid != expect_udid:
+                note(udid=udid, action=result["action"])
+                release_locked(name, lease, held_udid=udid)
+                remove_file(held_lock_path(lease_file))
+                raise Fail(f"'{name}' resolved to {udid}, expected {expect_udid}",
+                           kind="udid-changed", next_step="check the resolved device UDID")
+            result["leaseFd"] = fd
+            held_fd.pop_all()
         return result
 
 
 def release(name, lease, shutdown=False, wait=DEFAULT_WAIT):
     with DeviceLock(name, wait):
-        directory = lease_dir(name)
-        snapshot = lease_snapshot(directory, quiet=True)
-        held = [l for l in snapshot[1] if l["alive"]]
-        blocking = same_held_owner(name, lease, held)
-        if blocking:
-            raise held_leased_fail(name, blocking)
-        if shutdown:
-            require_readable_held(held)
-        reap_held_leases(directory, snapshot=snapshot)
-        devices = all_devices()
-        device = next((d for d in devices if d["name"] == name), None)
-        if device:
-            note(udid=device["udid"])
-        drop_stale_leases(name, {d["udid"] for d in devices})
-        record = reconcile_boot_record(name, devices)
-        path = lease_path(name, lease)
-        existed = os.path.exists(path)
-        # Strict with --shutdown: an unreadable lease may be someone's live one.
-        legacy = [l for l in read_leases(name, strict=shutdown) if l.get("kind") != "held"]
-        others = [l for l in legacy if l.get("owner") != lease] + held
-        mine = next((l for l in legacy if l["file"] == path), None)
-        same_device = bool(record and mine and mine.get("udid") == record.get("udid"))
-        responsible = same_device and lease in record.get("by", [])
-        did_shutdown = False
-        if shutdown and not others and responsible:
-            # The lease stays until the device is down, so a failed shutdown can be rerun.
-            log(f"shutting down {name} (booted by ensure for {', '.join(record['by'])})")
-            with phase("shutdown"):
-                shutdown_device(record["udid"])
-            remove_file(boot_record_path(name))
-            did_shutdown = True
-        elif shutdown and others:
-            log(f"not shutting down: still leased by {describe_leases(others)}")
-        elif shutdown and not existed:
-            log(f"not shutting down: {lease} holds no lease on it")
-        elif shutdown:
-            log("not shutting down: sim-vault did not boot it under this lease")
-        if same_device and not did_shutdown:
-            release_boot_record(boot_record_path(name), record, [lease], others)
-        remove_file(path)
-        return {"action": "released" if existed else "no-lease", "lease": lease,
-                "shutdown": did_shutdown, "remaining": [lease_view(l) for l in others]}
+        return release_locked(name, lease, shutdown)
+
+
+def release_locked(name, lease, shutdown=False, *, held_udid=None):
+    directory = lease_dir(name)
+    snapshot = lease_snapshot(directory, quiet=True)
+    path = lease_path(name, lease)
+    if held_udid is not None:
+        # run holds the lease flock here and removes its lock file after release.
+        snapshot = (snapshot[0], [l for l in snapshot[1]
+                                  if l["lockFile"] != held_lock_path(path)], snapshot[2])
+    held = [l for l in snapshot[1] if l["alive"]]
+    blocking = same_held_owner(name, lease, held)
+    if blocking:
+        raise held_leased_fail(name, blocking)
+    if shutdown:
+        require_readable_held(held)
+    reap_held_leases(directory, snapshot=snapshot)
+    devices = all_devices()
+    device = next((d for d in devices if d["name"] == name), None)
+    if device and held_udid is None:
+        note(udid=device["udid"])
+    drop_stale_leases(name, {d["udid"] for d in devices})
+    record = reconcile_boot_record(name, devices)
+    existed = os.path.exists(path)
+    # Strict with --shutdown: an unreadable lease may be someone's live one.
+    legacy = [l for l in read_leases(name, strict=shutdown) if l.get("kind") != "held"]
+    others = [l for l in legacy if l.get("owner") != lease] + held
+    mine = ({"udid": held_udid} if held_udid is not None
+            else next((l for l in legacy if l["file"] == path), None))
+    same_device = bool(record and mine and mine.get("udid") == record.get("udid"))
+    responsible = same_device and lease in record.get("by", [])
+    did_shutdown = False
+    if shutdown and not others and responsible:
+        # The lease stays until the device is down, so a failed shutdown can be rerun.
+        log(f"shutting down {name} (booted by ensure for {', '.join(record['by'])})")
+        with phase("shutdown"):
+            shutdown_device(record["udid"])
+        remove_file(boot_record_path(name))
+        did_shutdown = True
+    elif shutdown and others:
+        log(f"not shutting down: still leased by {describe_leases(others)}")
+    elif shutdown and not existed:
+        log(f"not shutting down: {lease} holds no lease on it")
+    elif shutdown:
+        log("not shutting down: sim-vault did not boot it under this lease")
+    if same_device and not did_shutdown:
+        release_boot_record(boot_record_path(name), record, [lease], others)
+    remove_file(path)
+    return {"action": "released" if existed else "no-lease", "lease": lease,
+            "shutdown": did_shutdown, "remaining": [lease_view(l) for l in others]}
+
+
+def run_release(name, owner, udid, fd, wait):
+    lock_file = held_lock_path(lease_path(name, owner))
+    with ExitStack() as held_fd:
+        held_fd.callback(os.close, fd)
+        with DeviceLock(name, wait):
+            held_fd.close()
+            with open(lock_file, "rb") as lock:
+                deadline = time.monotonic() + HELD_RELEASE_TIMEOUT
+                while True:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            # The recorded PID is ours and we just closed our fd. We
+                            # cannot identify the descendant still holding the lock.
+                            lease = {"owner": owner, "lockFile": lock_file, "alive": True}
+                            raise held_leased_fail(name, [lease], kind="held-by-other")
+                        time.sleep(0.05)
+                release_locked(name, owner, held_udid=udid)
+                remove_file(lock_file)
+
+
+def tty_foreground():
+    if os.isatty(0):
+        try:
+            return os.tcgetpgrp(0)
+        except OSError as exc:
+            if exc.errno != errno.ENOTTY:
+                raise
+            # A tty opened as stdin need not be our controlling terminal.
+    return None
+
+
+def give_tty_to(pgid):
+    # A process outside the foreground group may change it with SIGTTOU blocked.
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTTOU})
+    try:
+        os.tcsetpgrp(0, pgid)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+
+def signal_group(pgid, signum):
+    try:
+        os.killpg(pgid, signum)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def fork_run_child(command, env, foreground, mask):
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setpgrp()
+            for signum in (*RUN_SIGNALS, signal.SIGPIPE, signal.SIGXFSZ):
+                signal.signal(signum, signal.SIG_DFL)
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+            if foreground is not None:
+                # Hand over the tty before exec, so an immediate read cannot get SIGTTIN.
+                give_tty_to(os.getpgrp())
+            os.execvpe(command[0], command, env)
+        except BaseException as exc:
+            try:
+                os.write(2, f"sim-vault: cannot start {command[0]!r}: {exc}\n".encode(
+                    errors="backslashreplace"))
+            finally:
+                os._exit(127 if isinstance(exc, FileNotFoundError) else 126)
+    try:
+        # Either side can establish the group first. This lets the parent forward
+        # signals even before the child has finished its setup.
+        os.setpgid(pid, pid)
+    except (PermissionError, ProcessLookupError):
+        pass  # Already exec'd after setting its own group, or already gone.
+    return pid
+
+
+def wait_run_child(pid, foreground):
+    while True:
+        _, status = os.waitpid(pid, os.WUNTRACED if foreground is not None else 0)
+        if not os.WIFSTOPPED(status):
+            rc = os.waitstatus_to_exitcode(status)
+            return 128 - rc if rc < 0 else rc
+        give_tty_to(foreground)
+        os.kill(os.getpid(), signal.SIGSTOP)
+        # Execution resumes here on SIGCONT.
+        if signal_group(pid, 0):
+            give_tty_to(pid)
+            signal_group(pid, signal.SIGCONT)
+
+
+def terminate_run_group(pgid):
+    if signal_group(pgid, signal.SIGTERM):
+        deadline = time.monotonic() + RUN_GROUP_TIMEOUT
+        while signal_group(pgid, 0):
+            if time.monotonic() >= deadline:
+                signal_group(pgid, signal.SIGKILL)
+                return
+            time.sleep(0.05)
+
+
+def run_command(args, command, outcome):
+    owner = f"{args.lease}:{os.getpid()}-{secrets.token_hex(3)}"
+    acquired = ensure(args.name, args.create, args.boot, owner, args.exclusive,
+                      args.wait, args.deny_other_leases, args.allow_lease,
+                      held_lease=True, expect_udid=args.expect_udid)
+    udid, fd = acquired["udid"], acquired["leaseFd"]
+    outcome["stage"] = "child"
+    pgid = foreground = None
+    rc, kind = EXIT_ERROR, "child"
+
+    def forward(signum, _frame):
+        if pgid is not None:
+            signal_group(pgid, signum)
+
+    try:
+        note(action=acquired["action"], udid=udid)
+        foreground = tty_foreground()
+        os.set_inheritable(fd, True)
+        env = dict(os.environ, SIM_VAULT_NAME=args.name, SIM_VAULT_UDID=udid,
+                   SIM_VAULT_LEASE=owner, SIM_VAULT_LEASE_FD=str(fd))
+        with phase("child"):
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, RUN_SIGNALS)
+            try:
+                for signum in RUN_SIGNALS:
+                    signal.signal(signum, forward)
+                # fork/exec preserves all inherited fds. The DeviceLock was closed
+                # by ensure before we get here; the lease fd remains open.
+                pgid = fork_run_child(command, env, foreground, mask)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+            rc = outcome["childRc"] = wait_run_child(pgid, foreground)
+    except Interrupted as exc:
+        rc, kind = 128 + exc.signum, "interrupted"
+        log(f"error (exit {rc}, {kind}): interrupted by signal {exc.signum}")
+    except Exception as exc:
+        log(f"error (exit {rc}, {kind}): {exc}")
+    finally:
+        try:
+            with phase("teardown"):
+                try:
+                    if pgid is not None:
+                        try:
+                            if foreground is not None:
+                                give_tty_to(foreground)
+                        finally:
+                            terminate_run_group(pgid)
+                finally:
+                    run_release(args.name, owner, udid, fd, args.wait)
+            outcome["teardown"] = "ok"
+        except Exception as exc:
+            failure = exc if isinstance(exc, Fail) else Fail(str(exc), kind="teardown")
+            outcome["teardown"] = ("held-by-other" if failure.kind == "held-by-other"
+                                   else "failed")
+            if rc:
+                log(f"warning: teardown failed (exit {failure.code}, {failure.kind}): {failure}")
+            else:
+                outcome["stage"] = "teardown"
+                rc, kind = failure.code, failure.kind
+                log(f"error (exit {rc}, {kind}): {failure}")
+            log(f"next: {failure.next_step}")
+    return rc, kind if rc else None
 
 
 def shutdown_command(name, wait=DEFAULT_WAIT, busy_locks=()):
@@ -2143,32 +2343,67 @@ def build_parser():
         p.add_argument("--wait", type=float, default=DEFAULT_WAIT,
                        help="seconds to wait for the device lock (default 60), then exit 8")
 
+    def acquisition_flags(p, *, held=False):
+        p.add_argument("--create", metavar="TYPE",
+                       help="on 3/4, create it with this device type (name or identifier) and the "
+                            "newest installed runtime that supports it")
+        p.add_argument("--boot", action="store_true",
+                       help="boot it unless running, and wait until it has finished booting")
+        group = p.add_mutually_exclusive_group() if held else p
+        group.add_argument("--exclusive", action="store_true",
+                           help="with --lease: refuse (8) if another owner holds a lease or the "
+                                "device runs without one, and make later ensures by others refuse")
+        group.add_argument("--deny-other-leases", action="store_true",
+                           help="refuse (8) if another owner holds a lease; allowed owners "
+                                "apply only at acquisition. Blocks later ensures by others"
+                                if held else
+                                "with --lease: refuse (8, naming them) while owners other than "
+                                "OWNER and the --allow-lease ones hold a lease; else take a shared "
+                                "lease as usual. A running device without leases passes; later "
+                                "ensures by others are not refused (unlike --exclusive)")
+        p.add_argument("--allow-lease", action="append", default=[], metavar="OWNER",
+                       help="with --deny-other-leases: an owner whose lease does not count. "
+                            "Repeatable")
+        wait_flag(p)
+
     p = add("status", "what is local, archived and leased for <name>; never waits for the "
                       "device lock (probes it for an instant); 0 unless simctl fails")
     p.add_argument("name")
     p = add("ensure", "make <name> available: local device, else restore, else create "
                       "(with --create on 3/4); prints the UDID")
     p.add_argument("name")
-    p.add_argument("--create", metavar="TYPE",
-                   help="on 3/4, create it with this device type (name or identifier) and the "
-                        "newest installed runtime that supports it")
-    p.add_argument("--boot", action="store_true",
-                   help="boot it unless running, and wait until it has finished booting")
     p.add_argument("--lease", metavar="OWNER",
                    help="register OWNER as using the device until `release`; park refuses "
                         "(8) while any lease exists. Recorded before booting")
-    p.add_argument("--exclusive", action="store_true",
-                   help="with --lease: refuse (8) if another owner holds a lease or the "
-                        "device runs without one, and make later ensures by others refuse")
-    p.add_argument("--deny-other-leases", action="store_true",
-                   help="with --lease: refuse (8, naming them) while owners other than OWNER "
-                        "and the --allow-lease ones hold a lease; else take a shared lease as "
-                        "usual. A running device without leases passes; later ensures by "
-                        "others are not refused (unlike --exclusive)")
-    p.add_argument("--allow-lease", action="append", default=[], metavar="OWNER",
-                   help="with --deny-other-leases: an owner whose lease does not count. "
-                        "Repeatable")
-    wait_flag(p)
+    acquisition_flags(p)
+    p = sub.add_parser("run", help="run a command under a held simulator lease",
+                       usage="%(prog)s <name> --lease PREFIX [options] -- <cmd...>",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="""The command receives SIM_VAULT_NAME, SIM_VAULT_UDID, SIM_VAULT_LEASE
+(the full owner) and SIM_VAULT_LEASE_FD. Its stdout goes directly to the caller.
+
+Python launchers must pass the lease descriptor via pass_fds=(fd,), where
+fd = int(os.environ["SIM_VAULT_LEASE_FD"]). Close it for long-lived helpers:
+  eval "helper ... ${SIM_VAULT_LEASE_FD}>&-"
+Use numeric fd redirection on macOS /bin/bash 3.2. For a background command,
+put the & inside eval so the background shell drops the descriptor:
+  eval "helper ... ${SIM_VAULT_LEASE_FD}>&- &"
+
+If a leftover process keeps the lease alive, use the reported lsof <lock path>
+command to find candidates. Verify the process is yours before using kill <pid>.
+The next command that takes the device lock removes the lease after the last
+holder exits. Run leaves the device running during teardown.
+
+The final stderr line reports stage, rc, childRc, and teardown.
+Use --result-file to get the same fields as JSON.""")
+    p.add_argument("name")
+    p.add_argument("--lease", required=True, metavar="PREFIX",
+                   help="unique held lease owner with this prefix")
+    p.add_argument("--expect-udid", metavar="UDID",
+                   help="withdraw the lease and exit 1 if the resolved UDID differs")
+    p.add_argument("--result-file", metavar="FILE",
+                   help="write the run result as JSON")
+    acquisition_flags(p, held=True)
     p = add("restore", "bring <name> back from the vault; never creates or boots and ignores "
                        "leases (for people and old scripts; lease users call ensure); "
                        "prints the UDID")
@@ -2259,7 +2494,7 @@ def write_history(record):
         log(f"warning: could not write {HISTORY_PATH}: {exc}")
 
 
-def history_record(argv, args, rc, kind):
+def history_record(argv, args, rc, kind, run_outcome=None):
     """The history line of this call, or None for commands that are not recorded."""
     command = getattr(args, "command", None)
     name = getattr(args, "name", None)
@@ -2275,23 +2510,38 @@ def history_record(argv, args, rc, kind):
         cwd = os.getcwd()
     except OSError:
         cwd = None
-    return {"ts": now_iso(), "cmd": command, "name": name, "udid": fields.get("udid"),
-            "rc": rc, "kind": kind, "action": fields.get("action"),
-            "bytes": fields.get("bytes"), "posterMB": fields.get("posterMB"), "cwd": cwd,
-            "pid": os.getpid(), "seconds": round(time.monotonic() - RUN["started"], 3),
-            "phases": {k: round(v, 3) for k, v in RUN["phases"].items()}}
+    phases = {k: round(v, 3) for k, v in RUN["phases"].items()}
+    record = {"ts": now_iso(), "cmd": command, "name": name, "udid": fields.get("udid"),
+              "rc": rc, "kind": kind, "action": fields.get("action"),
+              "bytes": fields.get("bytes"), "posterMB": fields.get("posterMB"), "cwd": cwd,
+              "pid": os.getpid(), "seconds": round(time.monotonic() - RUN["started"], 3),
+              "phases": phases}
+    if run_outcome is not None:
+        record.update(run_outcome, lockWait=phases.get("lockWait", 0), child=phases.get("child"))
+    return record
 
 
 def main():
     RUN["started"] = time.monotonic()
     argv = sys.argv[1:]
-    as_json = "--json" in argv
+    is_run = argv[:1] == ["run"]
+    as_json = not is_run and "--json" in argv
+    run_outcome = None
+    command = []
+    if is_run:
+        run_outcome = {"stage": "acquire", "childRc": None, "teardown": "-"}
+        if "--" in argv:
+            boundary = argv.index("--")
+            argv, command = argv[:boundary], argv[boundary + 1:]
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGHUP, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     args, rc, kind, payload, lines = None, 0, None, None, []
     try:
-        args = build_parser().parse_args()
+        args = build_parser().parse_args(argv)
+        if is_run and not (args.lease and command and command[0]):
+            raise Fail("run needs --lease PREFIX and -- <cmd...>", EXIT_USAGE, "usage",
+                       "see `sim-vault run --help`")
         if getattr(args, "exclusive", False) and not args.lease:
             raise Fail("--exclusive needs --lease", EXIT_USAGE, "usage",
                        "pass --lease <owner> so the exclusivity outlives this command")
@@ -2321,6 +2571,9 @@ def main():
                             args.wait, args.deny_other_leases, args.allow_lease)
             if not as_json:
                 print(result["udid"])
+        elif args.command == "run":
+            rc, kind = run_command(args, command, run_outcome)
+            result = None
         elif args.command == "restore":
             result = restore(args.name, args.wait)
             if not as_json:
@@ -2338,8 +2591,9 @@ def main():
                 print_list(result)
         else:
             result = gc(args.dry_run, args.leases_older_than, args.name_prefix)
-        note(action=result.get("action"), udid=result.get("udid") or RUN["fields"].get("udid"))
-        payload = dict({"ok": True}, **result)
+        if result is not None:
+            note(action=result.get("action"), udid=result.get("udid") or RUN["fields"].get("udid"))
+            payload = dict({"ok": True}, **result)
     except Fail as exc:
         rc, kind = exc.code, exc.kind
         lines = [f"error (exit {rc}, {kind}): {exc}", f"next: {exc.next_step}"]
@@ -2370,15 +2624,30 @@ def main():
         signal.signal(signum, signal.SIG_IGN)
     for line in lines:
         log(line)
+    if run_outcome is not None:
+        run_outcome["rc"] = rc
+        result_file = getattr(args, "result_file", None)
+        if result_file is not None:
+            try:
+                write_json(result_file, run_outcome)
+            except OSError as exc:
+                log(f"warning: could not write {result_file}: {exc}")
     try:
-        record = history_record(argv, args, rc, kind)
+        record = history_record(argv, args, rc, kind, run_outcome)
     except Exception as exc:
         record = None
         log(f"warning: could not build the history line: {exc}")
     if record is not None:
         write_history(record)
-        payload.update(seconds=record["seconds"], phases=record["phases"])
-    emit(as_json, payload)
+        if payload is not None:
+            payload.update(seconds=record["seconds"], phases=record["phases"])
+    if run_outcome is not None:
+        child_rc = run_outcome["childRc"]
+        print(f"sim-vault-run: stage={run_outcome['stage']} rc={rc} "
+              f"childRc={'-' if child_rc is None else child_rc} "
+              f"teardown={run_outcome['teardown']}", file=sys.stderr, flush=True)
+    else:
+        emit(as_json, payload)
     sys.exit(rc)
 
 

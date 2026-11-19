@@ -41,6 +41,7 @@ second release on; v3.1.0 is the first.
 | Command   | What it does |
 |-----------|--------------|
 | `ensure`  | Get a simulator by name: use the local one, restore the archive, or create it (`--create`); optional `--boot` and `--lease` |
+| `run`     | Acquire a simulator as in `ensure` and run a command under a held lease |
 | `restore` | Restore an archived simulator and print its UDID |
 | `park`    | Archive a simulator to the vault, verify the read-back, then delete the local device |
 | `release` | Give up a lease taken by `ensure --lease` (optionally shut down) |
@@ -49,9 +50,36 @@ second release on; v3.1.0 is the first.
 | `list`    | List archives in the vault |
 | `gc`      | Remove what interrupted runs left behind (use `--dry-run` first) |
 
-Every command takes `--json`. `sim-vault --help` is the reference for subcommands, flags,
+Commands other than `run` take `--json`. `sim-vault --help` is the reference for subcommands, flags,
 environment variables (`SIM_VAULT_DIR`, `SIM_VAULT_HISTORY`) and the exit-code table that
 tells a caller what to do next; `sim-vault <command> --help` has the per-command flags.
+
+### Run a command with a held lease
+
+```sh
+sim-vault run "My Test Device" --lease project:test --boot --deny-other-leases -- ./run-tests
+```
+
+The command inherits `SIM_VAULT_NAME`, `SIM_VAULT_UDID`, the full owner in
+`SIM_VAULT_LEASE` and the lock descriptor in `SIM_VAULT_LEASE_FD`. With
+`--deny-other-leases` or `--exclusive`, the held lease blocks other owners'
+`ensure` calls. `--allow-lease` applies during acquisition.
+
+Pass `int(os.environ["SIM_VAULT_LEASE_FD"])` in Python's `subprocess.Popen`
+`pass_fds` tuple for any launcher that needs to keep the lease alive. Close the
+descriptor for long-lived helpers. In bash, use numeric redirection for macOS
+`/bin/bash` 3.2. Put the background operator inside the `eval` string.
+
+```bash
+eval "helper ... ${SIM_VAULT_LEASE_FD}>&- &"
+```
+
+The final stderr line and optional `--result-file` JSON give the stage, exit
+code, child exit code and teardown result. Teardown leaves the device running.
+If an escaped process still holds the lock, use the reported `lsof <lock path>`
+command to find candidates and verify ownership before using `kill <pid>`.
+The next command that takes the device lock removes the lease after the last
+holder exits.
 
 ## Security
 
