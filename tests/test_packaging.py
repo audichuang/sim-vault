@@ -33,6 +33,19 @@ class TestHistoryOverride(SimVaultCase):
                          [("shutdown", "SVTEST none", 0)])
         self.assertFalse(os.path.exists(self.default_history()))
 
+    def test_bare_filename_writes_to_cwd(self):
+        proc = self.sv("shutdown", "SVTEST none", "--json", SIM_VAULT_HISTORY="h.jsonl")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("warning", proc.stderr)
+        # the subprocess inherits this process's cwd
+        path = os.path.join(os.getcwd(), "h.jsonl")
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        with open(path) as h:
+            self.assertEqual([json.loads(line)["cmd"] for line in h], ["shutdown"])
+
+    def test_outer_variable_does_not_leak_into_tests(self):
+        self.assertNotIn("SIM_VAULT_HISTORY", self.env())
+
     def test_unset_keeps_default_path(self):
         proc = self.sv("shutdown", "SVTEST none", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)

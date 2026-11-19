@@ -373,7 +373,8 @@ class SimVaultCase(unittest.TestCase):
 
     # -- environment -----------------------------------------------------------------
     def env(self, **extra):
-        env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "SIM_VAULT_DIR")}
+        env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "SIM_VAULT_DIR",
+                                                          "SIM_VAULT_HISTORY")}
         env.update(HOME=self.home, PATH=f"{self.stub}:/usr/bin:/bin", FAKE_ROOT=self.fake,
                    SIM_VAULT_DIR=self.vault, SV_TEST_STUB_DIR=self.stub, SV_TEST_SCRIPT=SCRIPT,
                    TMPDIR=os.path.join(self.base, "tmp-default"))

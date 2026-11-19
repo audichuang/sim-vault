@@ -1861,7 +1861,7 @@ def write_history(record):
     runs whole. A failure only warns: the exit code and stdout stay as they are."""
     try:
         line = (json.dumps(record, ensure_ascii=False) + "\n").encode()
-        os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(HISTORY_PATH) or ".", exist_ok=True)
         fd = os.open(HISTORY_PATH, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
             # Bounded: a stopped process holding this lock must not keep the caller from
