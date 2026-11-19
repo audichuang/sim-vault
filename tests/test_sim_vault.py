@@ -745,12 +745,20 @@ class T1Core(SimVaultCase):
 
     def test_restore_aborts_when_metadata_write_fails(self):
         self.parked("SVTEST a")
-        os.makedirs(os.path.join(self.vault, "SVTEST a.json.partial"))
+        with open(self.loader) as h:
+            code = h.read()
+        patch = ("real_replace = mod.os.replace\n"
+                 "def fail_meta(src, dst):\n"
+                 "    if dst.endswith('.json'): raise OSError(5, 'simulated I/O error', dst)\n"
+                 "    return real_replace(src, dst)\n"
+                 "mod.os.replace = fail_meta\n")
+        write(self.loader, code.replace("mod.main()", patch + "mod.main()"))
         r = self.sv("restore", "SVTEST a")
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn("could not record the restored UDID", r.stderr)
         self.assertEqual(self.devices(), [])
         self.assertEqual(self.staging(), [])
+        self.assert_no_partials()
 
     def test_tar_keeps_lock_after_parent_dies(self):
         self.create("SVTEST a")

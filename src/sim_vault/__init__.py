@@ -408,21 +408,34 @@ def read_meta(meta_path):
 
 
 def open_private(path, mode="w"):
-    """Open path for writing with mode 0600 from creation, before any data is written."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Create path exclusively with mode 0600, refusing symlinks or existing files."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
         return os.fdopen(fd, mode)
     except BaseException:
         os.close(fd)
+        remove_file(path)
         raise
 
 
 def write_json(path, data, *, private=False):
-    opener = open_private if private else open
-    with opener(path + ".partial", "w") as handle:
-        json.dump(data, handle, indent=2)
-    os.replace(path + ".partial", path)
+    if not private:
+        with open(path + ".partial", "w") as handle:
+            json.dump(data, handle, indent=2)
+        os.replace(path + ".partial", path)
+        return
+    partial = f"{path}{partial_token()}.partial"
+    created = False
+    try:
+        with open_private(partial, "w") as handle:
+            created = True
+            json.dump(data, handle, indent=2)
+        os.replace(partial, path)
+    except BaseException:
+        if created:
+            remove_file(partial)
+        raise
 
 
 def safe_key(name):
@@ -1283,10 +1296,15 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace, keep_poste
     token = partial_token()
     partial = f"{tar_path}{token}.partial"
     meta_partial = f"{meta_path}{token}.partial"
+    created = set()
     log(f"archiving {name} ({udid}) to {tar_path}")
     proc = None
     try:
         for attempt in (1, 2):
+            if attempt == 2:
+                token = partial_token()
+                partial = f"{tar_path}{token}.partial"
+                meta_partial = f"{meta_path}{token}.partial"
             # Wall clock on purpose: compared with file mtimes below.
             started = time.time()
             digest = hashlib.sha256()
@@ -1301,6 +1319,7 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace, keep_poste
                                          "-C", DEFAULT_SET, "-cf", "-", udid],
                                         stdout=subprocess.PIPE, pass_fds=tuple(HELD_FDS))
                 with open_private(partial, "wb") as out:
+                    created.add(partial)
                     for chunk in iter(lambda: proc.stdout.read(CHUNK), b""):
                         digest.update(chunk)
                         out.write(chunk)
@@ -1326,6 +1345,7 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace, keep_poste
                 # files of a device whose processes were gone): flush, wait, archive once more.
                 log(f"written while archiving ({path}); waiting and archiving once more")
                 os.remove(partial)
+                created.discard(partial)
                 with phase("shutdownQuiesce"):
                     os.sync()
                     wait_until_quiet(device_dir)
@@ -1356,6 +1376,7 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace, keep_poste
         if any(rel in POSTER_TRIM for rel in excluded):
             meta["posterboardTrimmed"] = True
         with open_private(meta_partial, "w") as handle:
+            created.add(meta_partial)
             json.dump(meta, handle, indent=2)
         # Replace the previous archive only after the new one is verified.
         os.replace(partial, tar_path)
@@ -1369,7 +1390,7 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace, keep_poste
         # is verified, and the tar .partial is gone only once it was renamed into place.
         # Only this run's own files: an earlier run's leftovers are not ours to remove.
         keep = []
-        if os.path.exists(meta_partial) and not os.path.exists(partial):
+        if meta_partial in created and os.path.exists(meta_partial) and not os.path.exists(partial):
             # The new tar is in place: its metadata must follow, or the pair is broken
             # (new tar, old checksum) and no longer restores. Only if they really match;
             # otherwise keep the .partial for the next park/restore or a human.
@@ -1381,7 +1402,7 @@ def park_locked(name, device, tar_path, meta_path, shutdown, replace, keep_poste
             cleanup("pair the new metadata with the new tar", pair)
             keep = [meta_partial]
         for leftover in (partial, meta_partial):
-            if leftover in keep:
+            if leftover in keep or leftover not in created:
                 continue
             if os.path.exists(leftover):
                 cleanup(f"remove {leftover}", lambda p=leftover: os.remove(p))
