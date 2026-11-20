@@ -18,16 +18,16 @@ Pure Python standard library, a single module, no runtime dependencies.
 ## Install
 
 ```sh
-uv tool install git+https://github.com/audichuang/sim-vault@v3.1.0
+uv tool install git+https://github.com/audichuang/sim-vault@v4.1.0
 sim-vault --version
 ```
 
-`pipx install git+https://github.com/audichuang/sim-vault@v3.1.0` works the same way.
+`pipx install git+https://github.com/audichuang/sim-vault@v4.1.0` works the same way.
 
 ### Upgrade
 
 ```sh
-TAG=v3.1.0   # the tag you want
+TAG=v4.1.0   # the tag you want
 uv tool install --force "git+https://github.com/audichuang/sim-vault@$TAG"
 ```
 
